@@ -1,0 +1,21 @@
+# Build artifacts
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.exe
+nuitka-crash-report.xml
+nul
+
+# Captured pages and debug files
+page_*.png
+_debug_*.png
+_test_*.png
+
+# Claude/IDE config
+.claude/
+.vscode/
+
+# External tools (should be installed separately)
+tesseract/
