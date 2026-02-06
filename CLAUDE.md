@@ -52,6 +52,7 @@ Bereits vorhandene Outputs werden automatisch übersprungen.
 ## Voraussetzungen
 
 - Python 3.x installiert
+- Kindle-App auf **DEUTSCH** eingestellt (OCR sucht nach deutschen Menübegriffen: "Gehe zu", "Ansicht", "Titelseite", "Vollbildmodus")
 - Kindle-App offen mit geladenem Buch
 
 ---
