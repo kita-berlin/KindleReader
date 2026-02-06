@@ -83,13 +83,16 @@ keyboard_listener = None
 # Keyboard and Signal Handling
 # ============================================================
 
+FUNCTION_KEYS = {
+    keyboard.Key.f1, keyboard.Key.f2, keyboard.Key.f3, keyboard.Key.f4,
+    keyboard.Key.f5, keyboard.Key.f6, keyboard.Key.f7, keyboard.Key.f8,
+    keyboard.Key.f9, keyboard.Key.f10, keyboard.Key.f11, keyboard.Key.f12,
+}
+
 def on_key_press(key):
     """Global keyboard hook - any key stops the script (except F1-F12)."""
     global STOP_FLAG
-    # Ignore function keys F1-F12
-    if hasattr(key, 'vk') and key.vk is not None and 0x70 <= key.vk <= 0x7B:
-        return True  # Keep listener running
-    if isinstance(key, keyboard.Key) and key.name and key.name.startswith('f') and key.name[1:].isdigit():
+    if key in FUNCTION_KEYS:
         return True  # Keep listener running
     STOP_FLAG = True
     print("\n[!] Taste gedrueckt - stoppe...")
