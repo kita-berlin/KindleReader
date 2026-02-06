@@ -1,3 +1,7 @@
+# MIT License
+# Copyright (c) 2025 Quantrosoft
+# See LICENSE file for full license text.
+
 """
 Kindle Book Capture Tool
 ========================
@@ -30,25 +34,29 @@ import numpy as np
 from pathlib import Path
 from pynput import keyboard
 
-# pywinauto für zuverlässige Fenster-Erkennung
+# pywinauto für zuverlässige Fenster-Erkennung - ESSENTIELL!
 try:
     from pywinauto import Application, Desktop
     from pywinauto.timings import Timings
     Timings.after_click_wait = 0.1
     Timings.after_setcursorpos_wait = 0.01
-    PYWINAUTO_AVAILABLE = True
-except ImportError:
-    PYWINAUTO_AVAILABLE = False
+except ImportError as e:
+    print("[FEHLER] PYWINAUTO NICHT INSTALLIERT!")
+    print("[FEHLER] BEFEHL: pip install pywinauto")
+    print(f"[FEHLER] Details: {e}")
+    sys.exit(1)
 
-# Windows OCR für Menü-Erkennung
+# Windows OCR für Menü-Erkennung - ESSENTIELL! NICHT OPTIONAL!
 try:
     from winsdk.windows.media.ocr import OcrEngine
     from winsdk.windows.globalization import Language
     from winsdk.windows.graphics.imaging import BitmapDecoder
     from winsdk.windows.storage import StorageFile
-    WINDOWS_OCR_AVAILABLE = True
-except ImportError:
-    WINDOWS_OCR_AVAILABLE = False
+except ImportError as e:
+    print("[FEHLER] WINSDK NICHT INSTALLIERT!")
+    print("[FEHLER] BEFEHL: pip install winsdk")
+    print(f"[FEHLER] Details: {e}")
+    sys.exit(1)
 
 # Optional: Tkinter for click indicator
 try:
@@ -200,9 +208,6 @@ def get_ocr_engine():
     if _ocr_engine is not None:
         return _ocr_engine
 
-    if not WINDOWS_OCR_AVAILABLE:
-        return None
-
     for lang_tag in ['de-DE', 'de', 'en-US', 'en']:
         try:
             lang = Language(lang_tag)
@@ -213,7 +218,8 @@ def get_ocr_engine():
                     return engine
         except:
             continue
-    return None
+    print("[FEHLER] Keine unterstuetzte OCR-Sprache gefunden (de-DE, de, en-US, en)!")
+    sys.exit(1)
 
 
 async def ocr_image_async(engine, img_path):
@@ -262,11 +268,17 @@ def find_text_in_region(engine, region_bbox, search_text, take_topmost=True, sca
     """
     Search for text in a region using OCR.
     Returns (abs_x, abs_y, word_info) or None.
+
+    WICHTIG: OCR-Koordinaten sind in SCALED space, müssen aber zurück zu ABSOLUTE screen coords!
     """
     left, top, right, bottom = region_bbox
+    region_width = right - left
+    region_height = bottom - top
 
     # Screenshot the region
     img = ImageGrab.grab(bbox=(left, top, right, bottom))
+    original_width = img.width
+    original_height = img.height
 
     # Scale up for better OCR recognition
     if scale_factor > 1:
@@ -277,7 +289,7 @@ def find_text_in_region(engine, region_bbox, search_text, take_topmost=True, sca
     temp_path = Path.cwd() / "_temp_ocr.png"
     img.save(temp_path)
 
-    # Run OCR
+    # Run OCR (returns coords in SCALED space - pixel coords of scaled image)
     words = ocr_image(engine, temp_path)
 
     # Search for text
@@ -301,9 +313,14 @@ def find_text_in_region(engine, region_bbox, search_text, take_topmost=True, sca
     else:
         best_match = matches_sorted[-1]
 
-    # Calculate absolute coordinates (scale back)
-    abs_x = left + int(best_match['center_x'] / scale_factor)
-    abs_y = top + int(best_match['center_y'] / scale_factor)
+    # CRITICAL: Convert from SCALED image coords back to ORIGINAL region coords, then to ABSOLUTE screen coords
+    # OCR coords are in the SCALED image (e.g. 2x), so divide by scale_factor first
+    relative_x = int(best_match['center_x'] / scale_factor)  # Back to original region size
+    relative_y = int(best_match['center_y'] / scale_factor)
+
+    # Now add the region offset to get absolute screen coordinates
+    abs_x = left + relative_x
+    abs_y = top + relative_y
 
     return (abs_x, abs_y, best_match)
 
@@ -350,9 +367,6 @@ def get_kindle_window_pywinauto():
     """Find main Kindle window with pywinauto for reliable clicking.
     Skips WebView2 child windows by picking the largest visible window."""
     global _kindle_pywinauto
-
-    if not PYWINAUTO_AVAILABLE:
-        return None, None
 
     try:
         import ctypes
@@ -485,21 +499,17 @@ def detect_arrow_positions(book_region=None):
 
     screen_width, screen_height = pyautogui.size()
 
-    # Calculate positions to hover based on book region or screen
-    if book_region:
-        book_left, book_top, book_right, book_bottom = book_region
-        # Right margin: between book right edge and screen edge
-        right_hover_x = book_right + (screen_width - book_right) // 2
-        right_hover_y = (book_top + book_bottom) // 2
-        # Left margin: between screen left and book left edge
-        left_hover_x = book_left // 2
-        left_hover_y = (book_top + book_bottom) // 2
-    else:
-        # Fallback: use 95% / 5% of screen width
-        right_hover_x = int(screen_width * 0.95)
-        right_hover_y = screen_height // 2
-        left_hover_x = int(screen_width * 0.05)
-        left_hover_y = screen_height // 2
+    if not book_region:
+        print("[FEHLER] Kein Buchbereich angegeben fuer Pfeil-Erkennung!")
+        sys.exit(1)
+
+    book_left, book_top, book_right, book_bottom = book_region
+    # Right margin: between book right edge and screen edge
+    right_hover_x = book_right + (screen_width - book_right) // 2
+    right_hover_y = (book_top + book_bottom) // 2
+    # Left margin: between screen left and book left edge
+    left_hover_x = book_left // 2
+    left_hover_y = (book_top + book_bottom) // 2
 
     # Find right arrow: move mouse to right margin, wait for arrow to appear
     print(f"  Bewege Maus zum rechten Rand ({right_hover_x}, {right_hover_y})...")
@@ -513,9 +523,8 @@ def detect_arrow_positions(book_region=None):
         ARROW_RIGHT_POS = right_pos
         print(f"  Rechter Pfeil (weiter): ({right_pos[0]}, {right_pos[1]})")
     else:
-        # Use hover position as fallback
-        ARROW_RIGHT_POS = (right_hover_x, right_hover_y)
-        print(f"  [INFO] Verwende Hover-Position als Pfeilposition: ({right_hover_x}, {right_hover_y})")
+        print("[FEHLER] Rechter Navigationspfeil nicht gefunden!")
+        sys.exit(1)
 
     # Find left arrow: move mouse to left margin, wait for arrow to appear
     print(f"  Bewege Maus zum linken Rand ({left_hover_x}, {left_hover_y})...")
@@ -529,9 +538,8 @@ def detect_arrow_positions(book_region=None):
         ARROW_LEFT_POS = left_pos
         print(f"  Linker Pfeil (zurueck): ({left_pos[0]}, {left_pos[1]})")
     else:
-        # Use hover position as fallback
-        ARROW_LEFT_POS = (left_hover_x, left_hover_y)
-        print(f"  [INFO] Verwende Hover-Position als Pfeilposition: ({left_hover_x}, {left_hover_y})")
+        print("[FEHLER] Linker Navigationspfeil nicht gefunden!")
+        sys.exit(1)
 
     # Move mouse away from margins
     pyautogui.moveTo(screen_width // 2, screen_height // 2, duration=0.1)
@@ -541,34 +549,20 @@ def detect_arrow_positions(book_region=None):
 
 def click_next_page():
     """Click to go to next page."""
-    global ARROW_RIGHT_POS
-
-    if FULLSCREEN_MODE:
-        if ARROW_RIGHT_POS:
-            # Use detected arrow position
-            click_at(ARROW_RIGHT_POS[0], ARROW_RIGHT_POS[1], show_indicator=True)
-        else:
-            # Fallback: click on the right side of the screen
-            screen_width, screen_height = pyautogui.size()
-            click_at(int(screen_width * 0.95), int(screen_height * 0.5), show_indicator=True)
-        return True
-    return click_kindle(0.95, 0.5, show_indicator=True)
+    if not ARROW_RIGHT_POS:
+        print("[FEHLER] Rechter Pfeil wurde nicht erkannt!")
+        sys.exit(1)
+    click_at(ARROW_RIGHT_POS[0], ARROW_RIGHT_POS[1], show_indicator=True)
+    return True
 
 
 def click_prev_page():
     """Click to go to previous page."""
-    global ARROW_LEFT_POS
-
-    if FULLSCREEN_MODE:
-        if ARROW_LEFT_POS:
-            # Use detected arrow position
-            click_at(ARROW_LEFT_POS[0], ARROW_LEFT_POS[1], show_indicator=True)
-        else:
-            # Fallback: click on the left side of the screen
-            screen_width, screen_height = pyautogui.size()
-            click_at(int(screen_width * 0.05), int(screen_height * 0.5), show_indicator=True)
-        return True
-    return click_kindle(0.05, 0.5, show_indicator=True)
+    if not ARROW_LEFT_POS:
+        print("[FEHLER] Linker Pfeil wurde nicht erkannt!")
+        sys.exit(1)
+    click_at(ARROW_LEFT_POS[0], ARROW_LEFT_POS[1], show_indicator=True)
+    return True
 
 # ============================================================
 # Kindle Preparation (Find, Navigate, Fullscreen)
@@ -730,29 +724,27 @@ def navigate_to_title_page():
     """Navigate to title page using 'Gehe zu' -> 'Titelseite' via OCR."""
     print("[INFO] Navigiere zur Titelseite...")
 
-    # Get OCR engine
     engine = get_ocr_engine()
     if not engine:
-        print("  [WARNUNG] Windows OCR nicht verfuegbar, verwende Fallback...")
-        return navigate_to_title_page_fallback()
+        print("[FEHLER] Windows OCR nicht verfuegbar!")
+        sys.exit(1)
 
-    # Get Kindle window with pywinauto
     kindle_window, bounds = get_kindle_window_pywinauto()
     if not kindle_window or not bounds:
-        print("  [WARNUNG] pywinauto fehlgeschlagen, verwende Fallback...")
-        return navigate_to_title_page_fallback()
+        print("[FEHLER] pywinauto konnte Kindle-Fenster nicht finden!")
+        sys.exit(1)
 
     win_left, win_top, win_width, win_height = bounds
     print(f"  Fenster: left={win_left}, top={win_top}, width={win_width}, height={win_height}")
 
     # Step 1: Find "Gehe zu" in menu bar via OCR
     print("  Suche 'Gehe zu' im Hauptmenue...")
-    menu_region = (win_left, win_top - 5, win_left + 300, win_top + 30)
+    menu_region = (win_left, win_top - 5, win_left + win_width, win_top + 30)
     result = find_text_in_region(engine, menu_region, "Gehe", take_topmost=True)
 
     if not result:
-        print("  [WARNUNG] 'Gehe zu' nicht gefunden, verwende Fallback...")
-        return navigate_to_title_page_fallback()
+        print("[FEHLER] 'Gehe zu' nicht im Menue gefunden!")
+        sys.exit(1)
 
     goto_x, goto_y, goto_info = result
     print(f"  'Gehe zu' gefunden bei ({goto_x}, {goto_y})")
@@ -762,19 +754,45 @@ def navigate_to_title_page():
     time.sleep(0.8)
 
     # Step 3: Find "Titelseite" in dropdown via OCR
+    # Dropdown can be wide and tall - search a generous region below the menu click
     print("  Suche 'Titelseite' im Dropdown...")
     dropdown_region = (
-        goto_x - 50,
+        max(0, goto_x - 100),
         goto_y + 5,
-        goto_x + 150,
-        goto_y + 180
+        goto_x + 300,
+        goto_y + 400
     )
-    result = find_text_in_region(engine, dropdown_region, "Titelseite", take_topmost=True)
+
+    # Debug: show all OCR words found in dropdown region
+    temp_img = ImageGrab.grab(bbox=dropdown_region)
+    temp_path = Path.cwd() / "_temp_dropdown_debug.png"
+    scale = 2
+    temp_img_scaled = temp_img.resize((temp_img.width * scale, temp_img.height * scale), resample=Image.LANCZOS)
+    temp_img_scaled.save(temp_path)
+    debug_words = ocr_image(engine, temp_path)
+    try:
+        temp_path.unlink()
+    except:
+        pass
+    if debug_words:
+        print(f"  [DEBUG] OCR fand {len(debug_words)} Woerter im Dropdown:")
+        for w in debug_words:
+            print(f"    '{w['text']}' bei ({w['center_x']//scale}, {w['center_y']//scale})")
+    else:
+        print("  [DEBUG] OCR fand KEINE Woerter im Dropdown!")
+
+    # Try multiple search terms (DE and EN)
+    result = None
+    for search_term in ["Titelseite", "Titel", "Cover", "Anfang", "Beginning"]:
+        result = find_text_in_region(engine, dropdown_region, search_term, take_topmost=True)
+        if result:
+            print(f"  Gefunden mit Suchbegriff: '{search_term}'")
+            break
 
     if not result:
-        print("  [WARNUNG] 'Titelseite' nicht gefunden!")
+        print("[FEHLER] Kein passender Eintrag im Dropdown gefunden!")
         pyautogui.press('escape')
-        return False
+        sys.exit(1)
 
     title_x, title_y, title_info = result
     print(f"  'Titelseite' gefunden bei ({title_x}, {title_y})")
@@ -787,57 +805,30 @@ def navigate_to_title_page():
     return True
 
 
-def navigate_to_title_page_fallback():
-    """Fallback navigation using fixed positions."""
-    bounds = activate_and_get_kindle()
-    if not bounds:
-        return False
-
-    left, top, width, height = bounds
-
-    # Fixed position fallback
-    goto_x = left + int(width * 0.31)
-    goto_y = top + 100
-    print(f"  Verwende Fallback-Position: ({goto_x}, {goto_y})")
-
-    click_at(goto_x, goto_y)
-    time.sleep(0.7)
-
-    title_x = goto_x
-    title_y = goto_y + 72
-    click_at(title_x, title_y)
-    time.sleep(1.0)
-
-    print("[OK] Zur Titelseite navigiert (Fallback)")
-    return True
-
-
 def click_fullscreen_button():
     """Click the fullscreen button via Ansicht -> Vollbildmodus menu."""
     print("[INFO] Aktiviere Vollbildmodus...")
 
-    # Get OCR engine
     engine = get_ocr_engine()
     if not engine:
-        print("  [WARNUNG] Windows OCR nicht verfuegbar, verwende Fallback...")
-        return click_fullscreen_button_fallback()
+        print("[FEHLER] Windows OCR nicht verfuegbar!")
+        sys.exit(1)
 
-    # Get Kindle window with pywinauto
     kindle_window, bounds = get_kindle_window_pywinauto()
     if not kindle_window or not bounds:
-        print("  [WARNUNG] pywinauto fehlgeschlagen, verwende Fallback...")
-        return click_fullscreen_button_fallback()
+        print("[FEHLER] pywinauto konnte Kindle-Fenster nicht finden!")
+        sys.exit(1)
 
     win_left, win_top, win_width, win_height = bounds
 
     # Step 1: Find "Ansicht" in menu bar via OCR
     print("  Suche 'Ansicht' im Hauptmenue...")
-    menu_region = (win_left, win_top - 5, win_left + 300, win_top + 30)
+    menu_region = (win_left, win_top - 5, win_left + win_width, win_top + 30)
     result = find_text_in_region(engine, menu_region, "Ansicht", take_topmost=True)
 
     if not result:
-        print("  [WARNUNG] 'Ansicht' nicht gefunden, verwende Fallback...")
-        return click_fullscreen_button_fallback()
+        print("[FEHLER] 'Ansicht' nicht im Menue gefunden!")
+        sys.exit(1)
 
     ansicht_x, ansicht_y, ansicht_info = result
     print(f"  'Ansicht' gefunden bei ({ansicht_x}, {ansicht_y})")
@@ -852,14 +843,14 @@ def click_fullscreen_button():
         ansicht_x - 30,
         ansicht_y + 5,
         ansicht_x + 250,
-        ansicht_y + 200
+        ansicht_y + 250
     )
     result = find_text_in_region(engine, dropdown_region, "Vollbild", take_topmost=True)
 
     if not result:
-        print("  [WARNUNG] 'Vollbildmodus' nicht gefunden!")
+        print("[FEHLER] 'Vollbildmodus' nicht im Dropdown gefunden!")
         pyautogui.press('escape')
-        return False
+        sys.exit(1)
 
     vollbild_x, vollbild_y, vollbild_info = result
     print(f"  'Vollbildmodus' gefunden bei ({vollbild_x}, {vollbild_y})")
@@ -875,38 +866,14 @@ def click_fullscreen_button():
     return True
 
 
-def click_fullscreen_button_fallback():
-    """Fallback fullscreen using fixed position."""
-    bounds = activate_and_get_kindle()
-    if not bounds:
-        return False
-
-    left, top, width, height = bounds
-
-    # Fixed position fallback for fullscreen icon
-    fs_x = left + int(width * 0.47)
-    fs_y = top + 100
-    print(f"  Verwende Fallback-Position: ({fs_x}, {fs_y})")
-
-    click_at(fs_x, fs_y)
-    time.sleep(0.5)
-
-    set_fullscreen_mode(True)
-
-    print("[OK] Vollbildmodus aktiviert (Fallback)")
-    return True
-
-
 def wait_for_fullscreen_message_to_disappear():
     """Wait until the 'Press F11 to exit' message disappears using OCR."""
     print("[INFO] Warte bis Vollbild-Hinweis verschwindet...")
 
     engine = get_ocr_engine()
     if not engine:
-        # Fallback: just wait a fixed time
-        print("  [INFO] OCR nicht verfuegbar, warte 5 Sekunden...")
-        time.sleep(5.0)
-        return True
+        print("[FEHLER] Windows OCR nicht verfuegbar!")
+        sys.exit(1)
 
     max_wait = 10  # max seconds to wait
     check_interval = 0.5
@@ -948,17 +915,13 @@ def prepare_kindle_for_capture():
 
     print()
     print("[SCHRITT 2/6] Zur Titelseite navigieren...")
-    if not navigate_to_title_page():
-        print("[WARNUNG] Navigation zur Titelseite fehlgeschlagen")
-        # Continue anyway - user might already be at title
+    navigate_to_title_page()  # Bricht bei Fehler mit sys.exit(1) ab
 
     time.sleep(0.5)
 
     print()
     print("[SCHRITT 3/6] Vollbildmodus aktivieren...")
-    if not click_fullscreen_button():
-        print("[WARNUNG] Vollbildmodus-Aktivierung fehlgeschlagen")
-        return None
+    click_fullscreen_button()  # Bricht bei Fehler mit sys.exit(1) ab
 
     print()
     print("[SCHRITT 4/6] Warte auf Vollbildmodus...")
@@ -972,17 +935,14 @@ def prepare_kindle_for_capture():
     screenshot = grab_kindle_screenshot()
     if screenshot is None:
         print("[FEHLER] Konnte Screenshot nicht erstellen!")
-        return None
+        sys.exit(1)
 
     screen_width, screen_height = screenshot.size
 
     # In fullscreen: top=0, bottom=screen_height (always full height)
     # Only left/right margins need to be detected from title page
     print("[INFO] Erkenne linken/rechten Rand von Titelseite...")
-    title_region = detect_book_region_from_title_page(screenshot)
-    if not title_region:
-        print("[FEHLER] Konnte Buchbereich nicht erkennen!")
-        return None
+    title_region = detect_book_region_from_title_page(screenshot)  # Bricht bei Fehler ab
 
     t_left, _, t_right, _ = title_region
 
@@ -1218,17 +1178,9 @@ def detect_book_region_from_title_page(screenshot):
     if book_width > width * 0.2 and book_height > height * 0.3:
         return (left, top, right, bottom)
 
-    print("  [WARNUNG] Varianz-Erkennung fehlgeschlagen, verwende Fallback...")
-
-    # Fallback: assume centered content
-    content_width = int(width * 0.55)
-    left = (width - content_width) // 2
-    right = left + content_width
-    top = int(height * 0.05)
-    bottom = int(height * 0.85)
-
-    print(f"  Fallback-Grenzen: left={left}, right={right}, top={top}, bottom={bottom}")
-    return (left, top, right, bottom)
+    print("[FEHLER] Buchbereich konnte nicht erkannt werden!")
+    print(f"  Erkannte Groesse: {book_width} x {book_height} (zu klein)")
+    sys.exit(1)
 
 def margin_and_book_same_color(screenshot):
     """Check if margin and book content have similar colors."""

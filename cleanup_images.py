@@ -1,3 +1,7 @@
+# MIT License
+# Copyright (c) 2025 Quantrosoft
+# See LICENSE file for full license text.
+
 """
 Cleanup: Remove text-only images from markdown folders
 =======================================================
