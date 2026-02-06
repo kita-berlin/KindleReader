@@ -10,9 +10,15 @@ REM Skips steps if output already exists
 REM Get the directory where this batch file is located
 set BOOKREADER=%~dp0
 
+REM --- Python im PATH sicherstellen ---
+set "PYTHON_HOME=C:\Users\hmunz\AppData\Local\Programs\Python\Python314"
+if exist "%PYTHON_HOME%\python.exe" (
+    set "PATH=%PYTHON_HOME%;%PYTHON_HOME%\Scripts;%PATH%"
+)
+
 REM --- SCHRITT 0: ABHAENGIGKEITEN ---
 echo [INFO] Pruefe Python-Abhaengigkeiten...
-pip install -q -r "%BOOKREADER%requirements.txt" 2>nul
+pip install -r "%BOOKREADER%requirements.txt"
 if errorlevel 1 (
     echo [FEHLER] pip install fehlgeschlagen!
     echo [INFO] Bitte manuell ausfuehren: pip install -r "%BOOKREADER%requirements.txt"

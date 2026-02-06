@@ -1123,9 +1123,12 @@ def detect_book_region_from_title_page(screenshot):
 
     # Calculate variance for each column - content columns have higher variance
     # Use a sliding window to smooth out noise
+    # Use full height (5%-95%) to catch title text, images and other content near edges
+    scan_top = int(height * 0.05)
+    scan_bottom = int(height * 0.95)
     col_variance = np.zeros(width)
     for col in range(width):
-        col_variance[col] = np.var(gray[height//4:3*height//4, max(0,col-2):min(width,col+3)])
+        col_variance[col] = np.var(gray[scan_top:scan_bottom, max(0,col-2):min(width,col+3)])
 
     # Find threshold: margins have very low variance, content has higher
     max_variance = np.max(col_variance)
@@ -1230,16 +1233,19 @@ def find_text_bounds(screenshot):
 
     top_section = int(height * 0.1)
     bottom_section = int(height * 0.9)
+    # Use middle section for left/right detection to avoid window chrome/taskbar
+    mid_top = int(height * 0.2)
+    mid_bottom = int(height * 0.8)
 
     left = 0
     for col in range(width):
-        if has_text(gray[:, col]):
+        if has_text(gray[mid_top:mid_bottom, col]):
             left = col
             break
 
     right = width
     for col in range(width - 1, -1, -1):
-        if has_text(gray[:top_section, col]) or has_text(gray[bottom_section:, col]):
+        if has_text(gray[mid_top:mid_bottom, col]):
             right = col + 1
             break
 
