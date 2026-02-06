@@ -83,20 +83,24 @@ keyboard_listener = None
 # Keyboard and Signal Handling
 # ============================================================
 
-FUNCTION_KEYS = {
-    keyboard.Key.f1, keyboard.Key.f2, keyboard.Key.f3, keyboard.Key.f4,
-    keyboard.Key.f5, keyboard.Key.f6, keyboard.Key.f7, keyboard.Key.f8,
-    keyboard.Key.f9, keyboard.Key.f10, keyboard.Key.f11, keyboard.Key.f12,
-}
+# Only these keys will stop the script (normal typing keys)
+STOP_KEYS = {keyboard.Key.esc, keyboard.Key.space, keyboard.Key.enter}
 
 def on_key_press(key):
-    """Global keyboard hook - any key stops the script (except F1-F12)."""
+    """Global keyboard hook - only Esc/Space/Enter or letter/number keys stop the script."""
     global STOP_FLAG
-    if key in FUNCTION_KEYS:
-        return True  # Keep listener running
-    STOP_FLAG = True
-    print("\n[!] Taste gedrueckt - stoppe...")
-    return False  # Stop listener
+    # Character keys (letters, numbers, punctuation) -> stop
+    if isinstance(key, keyboard.KeyCode):
+        STOP_FLAG = True
+        print("\n[!] Taste gedrueckt - stoppe...")
+        return False
+    # Specific stop keys -> stop
+    if key in STOP_KEYS:
+        STOP_FLAG = True
+        print("\n[!] Taste gedrueckt - stoppe...")
+        return False
+    # Everything else (F-keys, media keys, modifiers, etc.) -> ignore
+    return True
 
 def start_keyboard_listener():
     """Start global keyboard listener."""
