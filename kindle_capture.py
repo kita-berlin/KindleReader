@@ -26,7 +26,10 @@ Usage:
    - Find and activate the Kindle window
    - Click once to focus the reader, then F11 -> clean fullscreen
    - Navigate to the very beginning / cover (PageUp until the page stops changing)
-   - Capture every fullscreen page (PrintWindow), paging forward with PageDown
+   - Detect the page format from the title page (the letterboxed cover stands out
+     from the uniform black/white margin via per-column/row pixel variance)
+   - Capture every page CROPPED to that title-page format (PrintWindow), paging
+     forward with PageDown - so all pages have the same format as the cover
 
 Author: Claude
 """
@@ -402,38 +405,38 @@ def find_and_activate_kindle():
 
 def prepare_kindle_for_capture():
     """Complete preparation sequence (hotkey-based, new WinUI Kindle):
-    find window -> fullscreen (F11) -> go to cover. Returns the capture region
-    (the full fullscreen page) or None on failure.
-
-    We capture the whole fullscreen page rather than trying to crop the content:
-    in clean fullscreen the page has only a small, uniform margin, the cover is
-    letterboxed, and per-page margin detection proved unreliable. The downstream
-    OCR (create_pdf / create_markdown) ignores the margins anyway."""
+    find window -> fullscreen (F11) -> go to cover -> detect the page format from
+    the title page. Returns the crop region (the title-page bounding box) or None
+    on failure. Every page is cropped to this region so all pages have the same
+    format as the title page (not the mostly-empty full screen)."""
     print()
-    print("[SCHRITT 1/3] Kindle-Fenster finden...")
+    print("[SCHRITT 1/4] Kindle-Fenster finden...")
     if not find_and_activate_kindle():
         return None
 
     time.sleep(0.5)
 
     print()
-    print("[SCHRITT 2/3] Vollbildmodus aktivieren (F11)...")
+    print("[SCHRITT 2/4] Vollbildmodus aktivieren (F11)...")
     enter_fullscreen()  # Bricht bei Fehler mit sys.exit(1) ab
     wait_until_screen_stable()
 
     print()
-    print("[SCHRITT 3/3] Zum Buchanfang (Cover) navigieren...")
+    print("[SCHRITT 3/4] Zum Buchanfang (Cover) navigieren...")
     go_to_book_start()
     wait_until_screen_stable(max_wait=4)
 
+    # We are on the title page now -> derive the page crop region from it.
+    print()
+    print("[SCHRITT 4/4] Seitenformat von der Titelseite bestimmen...")
     screenshot = grab_kindle_screenshot()
     if screenshot is None:
         print("[FEHLER] Konnte Screenshot nicht erstellen!")
         sys.exit(1)
 
-    screen_width, screen_height = screenshot.size
-    book_region = (0, 0, screen_width, screen_height)
-    print(f"[OK] Erfassungsbereich (Vollbild): {screen_width} x {screen_height} Pixel")
+    book_region = detect_page_region_from_cover(screenshot)  # Bricht bei Fehler ab
+    left, top, right, bottom = book_region
+    print(f"[OK] Seitenformat (von Titelseite): {right - left} x {bottom - top} Pixel")
 
     print()
     print("[OK] Kindle bereit fuer Erfassung!")
@@ -490,6 +493,43 @@ def grab_kindle_screenshot(retries=4, delay=0.2):
 # ============================================================
 # Image Analysis
 # ============================================================
+
+def detect_page_region_from_cover(cover_img):
+    """Detect the book PAGE region (bounding box) from the cover / title page and
+    return (left, top, right, bottom). The cover is a portrait rectangle that
+    stands out from the uniform black (dark mode) or white (light mode) letterbox
+    around it. We find that rectangle via per-column / per-row variance: the cover
+    content has pixel variation, the uniform letterbox has ~zero variance. ALL pages
+    are then cropped to this region, so every captured page has the same format as
+    the title page - not the full (mostly empty) screen."""
+    gray = np.asarray(cover_img.convert('RGB')).astype(np.float32).mean(axis=2)
+    height, width = gray.shape
+
+    # Per-column variance over the vertical middle (ignore the very top/bottom edges)
+    scan_top, scan_bottom = int(height * 0.02), int(height * 0.98)
+    col_var = np.array([np.var(gray[scan_top:scan_bottom, max(0, c - 2):min(width, c + 3)])
+                        for c in range(width)])
+    col_thr = col_var.max() * 0.05
+    left = next((c for c in range(width // 2) if col_var[c] > col_thr), 0)
+    right = next((c for c in range(width - 1, width // 2, -1) if col_var[c] > col_thr), width - 1) + 1
+
+    # Per-row variance over the detected column band
+    row_var = np.array([np.var(gray[max(0, r - 2):min(height, r + 3), left:right])
+                        for r in range(height)])
+    row_thr = row_var.max() * 0.05
+    top = next((r for r in range(height // 2) if row_var[r] > row_thr), 0)
+    bottom = next((r for r in range(height - 1, height // 2, -1) if row_var[r] > row_thr), height - 1) + 1
+
+    pw, ph = right - left, bottom - top
+    print(f"  Titelseiten-Format: ({left},{top})-({right},{bottom}) = {pw} x {ph} Pixel")
+
+    # Sanity: a real page must be a reasonable chunk of the screen
+    if pw > width * 0.15 and ph > height * 0.30:
+        return (left, top, right, bottom)
+
+    print(f"[FEHLER] Titelseiten-Format nicht erkennbar ({pw}x{ph} zu klein)!")
+    sys.exit(1)
+
 
 def images_are_similar(img1, img2, change_threshold=0.006, pixel_diff=24):
     """True if the two page images are essentially identical (i.e. the page did NOT
