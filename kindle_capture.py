@@ -34,8 +34,6 @@ Author: Claude
 import pyautogui
 pyautogui.FAILSAFE = False  # Disable fail-safe (mouse in corner)
 import pygetwindow as gw
-import subprocess
-import os
 import time
 import sys
 import signal
@@ -350,49 +348,23 @@ def press_prev_page():
 # Kindle Preparation (Find, Navigate, Fullscreen)
 # ============================================================
 
-def start_kindle_app():
-    """Start the Kindle application."""
-    kindle_paths = [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Amazon" / "Kindle" / "application" / "Kindle.exe",
-        Path("C:/Program Files/Amazon/Kindle/Kindle.exe"),
-        Path("C:/Program Files (x86)/Amazon/Kindle/Kindle.exe"),
-    ]
-
-    for kindle_path in kindle_paths:
-        if kindle_path.exists():
-            print(f"[INFO] Starte Kindle: {kindle_path}")
-            subprocess.Popen([str(kindle_path)], shell=False)
-            return True
-
-    print("[FEHLER] Kindle.exe nicht gefunden!")
-    return False
-
-
 def find_and_activate_kindle():
-    """Find Kindle window, start app if needed, and bring to foreground."""
+    """Find the Kindle window and bring it to the foreground.
+
+    Kindle must ALREADY be running with the book loaded - this tool does NOT
+    launch Kindle itself (see the requirements in CLAUDE.md). Returns False (which
+    aborts the run) if no Kindle window is found."""
     import ctypes
 
     print("[INFO] Suche Kindle-Fenster...")
     kindle = get_kindle_window()
 
     if not kindle:
-        print("[INFO] Kindle nicht offen - starte Kindle-App...")
-        if not start_kindle_app():
-            return False
-
-        # Wait for Kindle to start
-        for i in range(30):  # Max 30 seconds
-            time.sleep(1)
-            kindle = get_kindle_window()
-            if kindle:
-                print(f"[OK] Kindle gestartet nach {i+1}s")
-                break
-            if i % 5 == 4:
-                print(f"  Warte auf Kindle... ({i+1}s)")
-
-        if not kindle:
-            print("[FEHLER] Kindle konnte nicht gestartet werden!")
-            return False
+        print("[FEHLER] Kein Kindle-Fenster gefunden!")
+        print("[FEHLER] Kindle muss LAUFEN und das Buch GELADEN sein - das Tool")
+        print("[FEHLER] startet Kindle NICHT selbst. Bitte Kindle oeffnen, das Buch")
+        print("[FEHLER] laden und erneut ausfuehren.")
+        return False
 
     try:
         hwnd = kindle._hWnd

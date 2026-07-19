@@ -49,14 +49,23 @@ Bereits vorhandene Outputs werden automatisch übersprungen.
 
 ---
 
-## Voraussetzungen
+## Voraussetzungen (WICHTIG — vor dem Start prüfen!)
 
-- Python 3.x installiert
-- **Neues WinUI-Kindle für PC** (ohne Menüleiste, Hotkey-Steuerung). Die Navigation läuft über Hotkeys (+ **ein** Fokus-Klick, um dem Reader den Tastaturfokus zu geben) → **sprachunabhängig** (kein deutsches Menü mehr nötig).
-- Kindle-App offen mit geladenem Buch (Fenstermodus)
-- Bildschirm darf während des Laufs **nicht sperren**. Das Tool hält die Session per `SetThreadExecutionState` wach (Screensaver/Display-Timeout), eine per GPO/Policy erzwungene Sperre kann es aber nicht verhindern — dann bricht das Blättern ab.
+Vor jedem Lauf müssen diese Punkte stimmen, sonst wird das Ergebnis falsch:
 
-Hinweis: `create_pdf.py`/`create_markdown.py` nutzen weiterhin Windows-OCR (`winsdk`) — aber auf den **erfassten Seitenbildern** (Sprache automatisch de/en), nicht auf Menüs.
+- **Kindle muss LAUFEN.** Das Tool startet Kindle **NICHT** selbst — läuft kein Kindle-Fenster, bricht es mit klarer Fehlermeldung ab. (Neues WinUI-Kindle für PC, ohne Menüleiste; Steuerung sprachunabhängig über Hotkeys + ein Fokus-Klick.)
+- **Buch muss geladen sein** — im Reader geöffnet (nicht in der Bibliothek).
+- **Leseposition auf den ersten paar Seiten oder auf der Titelseite.** Das Tool blättert per PageUp zum Cover zurück — von weit hinten dauert das unnötig lange.
+- **Kindle-Einstellungen setzen** (oben rechts **Aa** → *Seiteneinstellungen*):
+  - **Layout: „Einzelne Spalte"** — sonst zeigt Kindle im Vollbild **zwei** Buchseiten nebeneinander (= 2 Seiten pro Bild).
+  - **Rand: Schieberegler ganz nach RECHTS** (max) — macht die Textspalte schmal/porträt, damit die Seiten dasselbe Format wie die Titelseite haben.
+  - **Ausrichtung: „Links".**
+  - **Abstand: „Mittel".**
+- **Während der Erfassung (~5 Min) Maus/Tastatur NICHT anfassen** — jeder Tastendruck stoppt den Lauf, Mausbewegung kann die Toolbar einblenden (landet sonst mit im Bild).
+- Bildschirm darf **nicht sperren**. Das Tool hält die Session per `SetThreadExecutionState` wach (Screensaver/Display-Timeout), eine per GPO/Policy erzwungene Sperre kann es aber nicht verhindern — dann bricht das Blättern ab.
+- Python 3.x installiert (Abhängigkeiten installiert scan.bat automatisch).
+
+Hinweis: `create_pdf.py`/`create_markdown.py` nutzen Windows-OCR (`winsdk`) auf den **erfassten Seitenbildern** (Sprache automatisch de/en).
 
 ---
 
@@ -64,7 +73,7 @@ Hinweis: `create_pdf.py`/`create_markdown.py` nutzen weiterhin Windows-OCR (`win
 
 1. **KEIN FALLBACK, KEIN WORKAROUND, KEINE ALTERNATIVEN!** Wenn etwas fehlschlägt → sofortiger Abbruch mit `sys.exit(1)` und klarer Fehlermeldung. Niemals mit geschätzten/festen Positionen weiterarbeiten. KEINE "Plan B"-Logik, KEINE Retry-Schleifen, KEINE alternativen Wege zum Ziel. Entweder der direkte Weg funktioniert oder das Script bricht ab.
 
-2. **KEINE hardcodierten Pixel-Positionen!** Navigation läuft über **Hotkeys** (F11 Vollbild, PageUp/PageDown blättern) — nicht über Menü-/Pfeil-Klicks. Maus-Einsatz nur: **ein** Fokus-Klick in die Fenster-/Bildschirmmitte (gibt dem Reader den Tastaturfokus) + Parken des Cursors — beides aus der Fenster-/Bildschirmgröße berechnet, nichts hardcodiert. Erfassung per `PrintWindow` (fensterbezogen), nicht per absolute Screen-Region.
+2. **KEINE hardcodierten Pixel-Positionen!** Navigation läuft über **Hotkeys** (F11 Vollbild, PageUp/PageDown blättern) — nicht über Menü-/Pfeil-Klicks. Maus-Einsatz nur: **ein** Fokus-Klick in den **linken schwarzen Rand** (~15% der Breite — NICHT die Mitte! Die kann bei einer Link-Tabelle einen Hyperlink treffen und öffnet dann den Browser) + Parken des Cursors — alles aus der Fenstergröße berechnet, nichts hardcodiert. Erfassung per `PrintWindow` (fensterbezogen), nicht per absolute Screen-Region.
 
 3. **Alle Python-Abhängigkeiten sind REQUIRED.** Die `scan.bat` installiert automatisch aus `requirements.txt`. Imports wie `winsdk`, `pywinauto` etc. dürfen NICHT optional sein - bei Fehlen → `sys.exit(1)`.
 
@@ -72,7 +81,7 @@ Hinweis: `create_pdf.py`/`create_markdown.py` nutzen weiterhin Windows-OCR (`win
 
 5. **Ablauf in kindle_capture.py (Hotkey-basiert, neues WinUI-Kindle):**
    1. Kindle-Fenster finden + aktivieren
-   2. **Einmal** in die Bildschirmmitte klicken → gibt dem WinUI-Reader den Tastaturfokus (**nötig für F11 UND die Seitentasten** — F11 ist NICHT App-weit!), dann **F11** → Vollbild. Vollbild setzt auf eine saubere Seite zurück; die Toolbar-Chrome des Klicks wird **nicht** mit-übernommen (nur ein kurzer „Drücke F11"-Hinweis, der ausfadet)
+   2. **Einmal** in den **linken schwarzen Rand** (~15% der Breite) klicken → gibt dem WinUI-Reader den Tastaturfokus (**nötig für F11 UND die Seitentasten** — F11 ist NICHT App-weit!). **NICHT die Mitte** — die kann bei Link-Tabellen einen Hyperlink treffen und öffnet den Browser. Dann **F11** → Vollbild (setzt auf eine saubere Seite zurück; die Toolbar-Chrome des Klicks wird nicht mit-übernommen)
    3. Warten bis Bildschirm stabil (Hinweis ausgefadet)
    4. Zum Cover: **PageUp** bis sich die Seite nicht mehr ändert. Ab hier **nur noch Tasten** + Maus in neutraler Mitte geparkt (kein weiterer Klick → keine Chrome). **KEIN Ctrl+G** (dessen Dialog stiehlt den Fokus und killt die Seitentasten)
    5. Jede Vollbild-Seite per **`PrintWindow(PW_RENDERFULLCONTENT)`** erfassen (funktioniert auch im geschützten/exklusiven Vollbild, wo GDI-Screengrab schwarz liefert), mit **PageDown** vorwärts bis Buchende
