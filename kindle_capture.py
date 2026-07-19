@@ -514,21 +514,30 @@ def grab_kindle_screenshot(retries=4, delay=0.2):
 # Image Analysis
 # ============================================================
 
-def images_are_similar(img1, img2, threshold=0.99):
-    """Compare two images and return True if they are very similar."""
+def images_are_similar(img1, img2, change_threshold=0.006, pixel_diff=24):
+    """True if the two page images are essentially identical (i.e. the page did NOT
+    turn). Compares the FRACTION of pixels that changed noticeably - NOT the mean
+    difference. With a single-column page the content is a small region on a large,
+    identical (black) background, so a mean-difference metric is dominated by that
+    background and wrongly reports 'no change' for two clearly different sparse pages.
+    Counting changed pixels is robust: measured on real pages a page turn changes
+    ~5-37% of pixels, while an unchanged page changes 0%. So anything below ~0.6% is
+    treated as 'no turn'."""
     if img1 is None or img2 is None:
         return False
 
     if img1.size != img2.size:
         return False
 
-    arr1 = np.array(img1)
-    arr2 = np.array(img2)
+    a = np.asarray(img1).astype(np.int16)
+    b = np.asarray(img2).astype(np.int16)
+    if a.ndim == 3:
+        diff = np.abs(a - b).max(axis=2)
+    else:
+        diff = np.abs(a - b)
 
-    diff = np.abs(arr1.astype(float) - arr2.astype(float))
-    similarity = 1 - (np.mean(diff) / 255)
-
-    return similarity > threshold
+    changed_fraction = float(np.mean(diff > pixel_diff))
+    return changed_fraction < change_threshold
 
 # ============================================================
 # Main Functions
