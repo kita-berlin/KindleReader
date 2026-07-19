@@ -24,13 +24,13 @@ WICHTIG: Genau diese Befehle verwenden!
    powershell -Command "New-Item -ItemType Directory -Force -Path '<ZIELORDNER>'"
    ```
 
-2. **scan.bat starten** - MUSS in einer externen Console laufen:
+2. **scan.bat starten** - Buch-Ordner als **Argument** übergeben:
    ```
-   powershell -Command "Start-Process -FilePath '<PFAD_ZU_DIESEM_ORDNER>\scan.bat' -WorkingDirectory '<ZIELORDNER>'"
+   powershell -Command "Start-Process -FilePath '<PFAD_ZU_DIESEM_ORDNER>\scan.bat' -ArgumentList '<ZIELORDNER>'"
    ```
-   - `<ZIELORDNER>` = der vom User gewählte Pfad (Schritt 2)
+   - `<ZIELORDNER>` = der Buch-Ordner (dort landen `pages\`, PDF, `markdown\`)
    - `<PFAD_ZU_DIESEM_ORDNER>` = absoluter Pfad zu diesem KindleReader-Ordner
-   - Die scan.bat MUSS im Zielordner als Working Directory laufen (nutzt Ordnername als Buchname)
+   - scan.bat wechselt selbst in den übergebenen Ordner (Ordnername = Buchname). **Ohne** Argument (z.B. User-Doppelklick) fragt scan.bat den Buch-Ordner per **Ordner-Dialog** ab (Start: `_Kindle`).
    - WICHTIG: NUR `powershell Start-Process` verwenden! `start` und `cmd /k` funktionieren NICHT aus Claude Code heraus!
 
 3. **Nach dem Start**: Dem User mitteilen, dass die Console offen ist und der Scan läuft.
