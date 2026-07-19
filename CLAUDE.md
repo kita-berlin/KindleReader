@@ -43,7 +43,7 @@ Die `scan.bat` führt folgende Schritte aus:
 
 1. **Kindle Capture** (`kindle_capture.py`) - Erfasst Screenshots des Kindle-Buches in `pages/`
 2. **PDF-Erstellung** (`create_pdf.py`) - Erstellt durchsuchbares PDF als `[BOOKNAME].pdf`
-3. **Markdown-Generierung** (`create_markdown.py`) - Erzeugt Markdown in `markdown/book.md`
+3. **Markdown-Generierung** (`create_markdown.py`) - Erzeugt Markdown in `markdown/<Ordnername>.md`
 
 Bereits vorhandene Outputs werden automatisch übersprungen.
 

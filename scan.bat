@@ -38,13 +38,13 @@ set HAS_MD=0
 
 if exist "pages\page_*.png" set HAS_PAGES=1
 if exist "%BOOKNAME%.pdf" set HAS_PDF=1
-if exist "markdown\book.md" set HAS_MD=1
+if exist "markdown\%BOOKNAME%.md" set HAS_MD=1
 
 if %HAS_PAGES%==1 if %HAS_PDF%==1 if %HAS_MD%==1 (
     echo [INFO] Alles vorhanden - nichts zu tun.
     echo   Pages: pages\
     echo   PDF:   %BOOKNAME%.pdf
-    echo   MD:    markdown\book.md
+    echo   MD:    markdown\%BOOKNAME%.md
     pause
     exit /b 0
 )
