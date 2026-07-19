@@ -39,6 +39,8 @@ Author: Claude
 import sys
 import asyncio
 import io
+import json
+import subprocess
 import tempfile
 import shutil
 from pathlib import Path
@@ -60,6 +62,8 @@ IMAGE_MAX_WIDTH = 1200      # Max width for saved images
 TEXT_VARIANCE_THRESHOLD = 0.15  # Pages with text coverage below this are "image pages"
 MIN_TEXT_WORDS = 10         # Minimum words to consider a page as "text page"
 PDF_DPI = 200               # DPI for rendering PDF pages as images
+OCR_SUBPROCESS_RETRIES = 4  # Retries when a page's isolated OCR subprocess crashes
+OCR_SUBPROCESS_TIMEOUT = 90 # Seconds per page OCR subprocess before giving up
 
 # Windows OCR imports
 try:
@@ -113,9 +117,15 @@ async def ocr_image_async(engine, img_path):
         lines = []
         if result and result.lines:
             for line in result.lines:
-                line_text = " ".join(w.text.strip() for w in line.words if w.text.strip())
-                if line_text:
-                    rect = line.words[0].bounding_rect
+                # Materialize the WinRT word collection into a Python list by
+                # ITERATING it. Indexing the WinRT collection directly
+                # (line.words[0]) triggers a native access violation (0xC0000005)
+                # in this winsdk version; iteration is safe (this is exactly how
+                # create_pdf.py does it, and that path never crashes).
+                words = list(line.words)
+                line_text = " ".join(w.text.strip() for w in words if w.text.strip())
+                if line_text and words:
+                    rect = words[0].bounding_rect
                     lines.append({
                         'text': line_text,
                         'y': int(rect.y),
@@ -124,12 +134,13 @@ async def ocr_image_async(engine, img_path):
         return lines
 
     except Exception as e:
-        print(f"  [WARNUNG] OCR fehlgeschlagen: {e}")
+        print(f"  [WARNUNG] OCR fehlgeschlagen: {e}", file=sys.stderr)
         return []
 
 
-def ocr_image(engine, img_path):
-    """Synchronous wrapper for Windows OCR. Returns list of line dicts."""
+def _ocr_image_inprocess(engine, img_path):
+    """Synchronous Windows OCR in THIS process. Returns list of line dicts.
+    Used inside the isolated per-page subprocess (see ocr_image)."""
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -138,8 +149,46 @@ def ocr_image(engine, img_path):
         finally:
             loop.close()
     except Exception as e:
-        print(f"  [WARNUNG] OCR fehlgeschlagen: {e}")
+        print(f"  [WARNUNG] OCR fehlgeschlagen: {e}", file=sys.stderr)
         return []
+
+
+def ocr_image(engine, img_path):
+    """OCR one page in an ISOLATED subprocess and return list of line dicts.
+
+    The winsdk (WinRT) OCR intermittently crashes the whole process with a native
+    access violation (0xC0000005). Running each page's OCR in its own short-lived
+    subprocess means such a crash only kills that subprocess - we retry the page,
+    and after OCR_SUBPROCESS_RETRIES give up on just that one page (empty result)
+    instead of losing the whole run. The result travels back as JSON (ensure_ascii),
+    which also sidesteps any console-encoding (cp1252) issues.
+
+    `engine` is unused here - the subprocess creates its own engine."""
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--ocr-one", str(img_path)]
+    for _ in range(OCR_SUBPROCESS_RETRIES):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=OCR_SUBPROCESS_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                return json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                pass  # garbled output -> retry
+        # non-zero exit (e.g. native crash) or empty/garbled output -> retry
+    print(f"  [WARNUNG] OCR nach {OCR_SUBPROCESS_RETRIES} Versuchen fehlgeschlagen "
+          f"(Seite uebersprungen)", end=" ")
+    return []
+
+
+def _ocr_one_cli(img_path):
+    """Subprocess entry point: OCR a single image and print the line list as JSON
+    to stdout. Isolated so a native winsdk crash cannot kill the main run."""
+    engine, _lang = check_ocr_languages()
+    lines = _ocr_image_inprocess(engine, img_path) if engine else []
+    sys.stdout.write(json.dumps(lines))
+    sys.stdout.flush()
 
 
 # ============================================================
@@ -453,4 +502,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Isolated single-page OCR mode (spawned by ocr_image as a crash-safe subprocess)
+    if len(sys.argv) == 3 and sys.argv[1] == "--ocr-one":
+        _ocr_one_cli(sys.argv[2])
+    else:
+        main()
