@@ -217,16 +217,21 @@ def _is_fullscreen():
     return kindle.width >= screen_width * 0.98 and kindle.height >= screen_height * 0.98
 
 
-def _click_reader_center():
-    """Left-click the center of the current Kindle window to give the WinUI reader
-    keyboard focus (required for both F11 and the page keys). The center is
-    neutral - it does not turn a page. In windowed mode this briefly shows the
-    toolbar chrome, but entering fullscreen (F11) resets to a clean page."""
+def _click_reader_margin():
+    """Left-click the LEFT black margin of the reading pane (~15% of the width,
+    mid-height) to give the WinUI reader keyboard focus (required for both F11 and
+    the page keys). We deliberately do NOT click the center: with a table of links
+    (e.g. the book's resources page) the center can land on a hyperlink, which
+    Kindle then opens in the browser. With the single-column layout the content is
+    a centred column, so ~15% from the left is always empty margin (no link, past
+    the '<' arrow at the very edge). Side effect: this may page one step back
+    (left tap zone) - harmless, go_to_book_start() pages back to the cover anyway."""
     kindle = get_kindle_window()
     if not kindle:
         print("[FEHLER] Kindle-Fenster fuer Fokus-Klick nicht gefunden!")
         sys.exit(1)
-    pyautogui.click(kindle.left + kindle.width // 2, kindle.top + kindle.height // 2)
+    pyautogui.click(kindle.left + int(kindle.width * 0.15),
+                    kindle.top + kindle.height // 2)
     time.sleep(0.5)
 
 
@@ -244,7 +249,7 @@ def enter_fullscreen():
     # If already fullscreen, leave it first so the enter below is the clean,
     # focus-granting click->F11 path (F11-exit also needs the click for focus).
     if _is_fullscreen():
-        _click_reader_center()
+        _click_reader_margin()
         pyautogui.press('f11')
         time.sleep(1.5)
 
@@ -255,7 +260,7 @@ def enter_fullscreen():
             park_mouse_center()
             print(f"[OK] Vollbildmodus aktiv (Versuch {attempt})")
             return
-        _click_reader_center()   # give the reader focus so F11 is delivered
+        _click_reader_margin()   # give the reader focus so F11 is delivered
         pyautogui.press('f11')
         time.sleep(1.6)
         if _is_fullscreen():
@@ -613,7 +618,7 @@ def capture_pages(output_folder, book_region):
                 # then give it one more chance before concluding "end".
                 print("[INFO] Keine Aenderung - pruefe Buchende / Fokus...")
                 find_and_activate_kindle()
-                _click_reader_center()
+                _click_reader_margin()
                 park_mouse_center()
                 wait_until_screen_stable(max_wait=6)
                 press_next_page()
