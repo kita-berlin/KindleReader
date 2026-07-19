@@ -170,11 +170,11 @@ def main():
     capture_packages = [
         "pyautogui",
         "pygetwindow",
-        "pywinauto",
         "PIL",
         "numpy",
         "pynput",
-        "winsdk",
+        "win32gui",
+        "win32ui",
     ]
     success1 = build_exe(project_root, "kindle_capture.py", "kindle_capture.exe", capture_packages)
 

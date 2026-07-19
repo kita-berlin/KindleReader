@@ -3,7 +3,6 @@ PyGetWindow
 Pillow
 numpy
 pynput
-pywinauto
-winsdk
 pywin32
+winsdk
 reportlab

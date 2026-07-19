@@ -7,15 +7,26 @@ Kindle Book Capture Tool
 ========================
 Captures all pages from a Kindle book as PNG images.
 
+Works with the new WinUI-3 Kindle for PC, which has NO menu bar - navigation is
+done via hotkeys. The reader renders inside a WinUI content bridge child window
+that only responds to F11 / the page keys when it has keyboard focus, and the only
+reliable way to focus it is a single click in the reading area. So the tool clicks
+ONCE to focus the reader, presses F11 (fullscreen resets to a clean page - the
+click's toolbar chrome does not carry in), then navigates with keys only while the
+mouse stays parked in a neutral spot. Ctrl+G is avoided (its dialog steals the
+reader's focus); the cover is reached by pressing PageUp until the page stops
+changing. Pages are captured with PrintWindow, which works even when Kindle's
+fullscreen blocks the normal GDI screen grab.
+
 Usage:
-1. Open Kindle app with the book you want to capture
+1. Open Kindle app with the book you want to capture (windowed, book loaded)
 2. Change to the book folder (used as output folder)
 3. Run: kindle_capture.exe
 4. The script will automatically:
-   - Find the Kindle window
-   - Navigate to the title page
-   - Enter fullscreen mode
-   - Capture all pages as PNG files
+   - Find and activate the Kindle window
+   - Click once to focus the reader, then F11 -> clean fullscreen
+   - Navigate to the very beginning / cover (PageUp until the page stops changing)
+   - Capture every fullscreen page (PrintWindow), paging forward with PageDown
 
 Author: Claude
 """
@@ -28,52 +39,29 @@ import os
 import time
 import sys
 import signal
-import asyncio
-from PIL import Image, ImageGrab
+from PIL import Image
 import numpy as np
 from pathlib import Path
 from pynput import keyboard
 
-# pywinauto für zuverlässige Fenster-Erkennung - ESSENTIELL!
+# pywin32 for PrintWindow-based window capture. ESSENTIAL, not optional: the new
+# Kindle's fullscreen can enter an exclusive/protected mode where GDI screen grab
+# (PIL.ImageGrab) fails or returns black. PrintWindow(PW_RENDERFULLCONTENT) reads
+# the window's own rendering (WinUI + WebView2 content) and works regardless.
 try:
-    from pywinauto import Application, Desktop
-    from pywinauto.timings import Timings
-    Timings.after_click_wait = 0.1
-    Timings.after_setcursorpos_wait = 0.01
+    import win32gui
+    import win32ui
 except ImportError as e:
-    print("[FEHLER] PYWINAUTO NICHT INSTALLIERT!")
-    print("[FEHLER] BEFEHL: pip install pywinauto")
+    print("[FEHLER] PYWIN32 NICHT INSTALLIERT!")
+    print("[FEHLER] BEFEHL: pip install pywin32")
     print(f"[FEHLER] Details: {e}")
     sys.exit(1)
-
-# Windows OCR für Menü-Erkennung - ESSENTIELL! NICHT OPTIONAL!
-try:
-    from winsdk.windows.media.ocr import OcrEngine
-    from winsdk.windows.globalization import Language
-    from winsdk.windows.graphics.imaging import BitmapDecoder
-    from winsdk.windows.storage import StorageFile
-except ImportError as e:
-    print("[FEHLER] WINSDK NICHT INSTALLIERT!")
-    print("[FEHLER] BEFEHL: pip install winsdk")
-    print(f"[FEHLER] Details: {e}")
-    sys.exit(1)
-
-# Optional: Tkinter for click indicator
-try:
-    import tkinter as tk
-    TKINTER_AVAILABLE = True
-except ImportError:
-    TKINTER_AVAILABLE = False
-
-# Click indicator overlay
-current_overlay = None
 
 # ============================================================
 # Configuration
 # ============================================================
-WAIT_AFTER_CLICK = 0.5  # Seconds to wait after click
-MAX_NO_CHANGE_COUNT = 3  # Stop after this many pages without change
-FULLSCREEN_MSG_TIMEOUT = 10  # Max seconds to wait for fullscreen message to disappear
+WAIT_AFTER_PAGE = 0.5  # Seconds to wait after a page-turn keypress (also the render poll interval)
+RENDER_POLL_TRIES = 5  # Max polls to wait for a page to render/advance before concluding "no advance"
 
 # Global flag for immediate stop
 STOP_FLAG = False
@@ -131,218 +119,12 @@ def check_stop_and_exit():
     """Check if stop was requested and exit if so."""
     if STOP_FLAG:
         stop_keyboard_listener()
-        hide_click_indicator()
         print("\n[GESTOPPT] Script vom Benutzer gestoppt.")
         sys.exit(1)
 
 # ============================================================
-# Click Indicator (Red Dot)
-# ============================================================
-
-def show_click_indicator(x, y):
-    """Show visual indicator at click position."""
-    global current_overlay
-
-    if not TKINTER_AVAILABLE:
-        return
-
-    hide_click_indicator()
-
-    try:
-        import win32gui
-        import win32con
-
-        overlay = tk.Tk()
-        overlay.overrideredirect(True)
-        overlay.attributes('-topmost', True)
-        overlay.attributes('-alpha', 0.9)
-
-        size = 30
-        target_x = x - size // 2
-        target_y = y - size // 2
-
-        overlay.geometry(f"{size}x{size}+{target_x}+{target_y}")
-
-        canvas = tk.Canvas(overlay, width=size, height=size, bg='black', highlightthickness=0)
-        canvas.pack()
-
-        center = size // 2
-        radius = 12
-        canvas.create_oval(
-            center - radius, center - radius,
-            center + radius, center + radius,
-            fill='red', outline='red', width=2
-        )
-
-        try:
-            overlay.update()
-            overlay.update_idletasks()
-        except Exception:
-            pass
-
-        try:
-            hwnd = int(overlay.winfo_id())
-            win32gui.SetWindowPos(
-                hwnd, win32con.HWND_TOPMOST,
-                target_x, target_y, size, size,
-                win32con.SWP_SHOWWINDOW | win32con.SWP_NOACTIVATE
-            )
-        except Exception:
-            pass
-
-        current_overlay = overlay
-
-    except Exception as e:
-        pass  # Silently fail if overlay can't be shown
-
-
-def hide_click_indicator():
-    """Remove visual overlay."""
-    global current_overlay
-    if current_overlay:
-        try:
-            current_overlay.quit()
-            current_overlay.destroy()
-        except:
-            pass
-        current_overlay = None
-
-# ============================================================
-# Windows OCR Functions
-# ============================================================
-
-# Global OCR engine
-_ocr_engine = None
-
-def get_ocr_engine():
-    """Initialize and return Windows OCR engine."""
-    global _ocr_engine
-    if _ocr_engine is not None:
-        return _ocr_engine
-
-    for lang_tag in ['de-DE', 'de', 'en-US', 'en']:
-        try:
-            lang = Language(lang_tag)
-            if OcrEngine.is_language_supported(lang):
-                engine = OcrEngine.try_create_from_language(lang)
-                if engine:
-                    _ocr_engine = engine
-                    return engine
-        except:
-            continue
-    print("[FEHLER] Keine unterstuetzte OCR-Sprache gefunden (de-DE, de, en-US, en)!")
-    sys.exit(1)
-
-
-async def ocr_image_async(engine, img_path):
-    """Run OCR on image and return word list with positions."""
-    try:
-        abs_path = str(Path(img_path).resolve())
-        storage_file = await StorageFile.get_file_from_path_async(abs_path)
-        stream = await storage_file.open_read_async()
-        decoder = await BitmapDecoder.create_async(stream)
-        bitmap = await decoder.get_software_bitmap_async()
-        result = await engine.recognize_async(bitmap)
-
-        words = []
-        if result and result.lines:
-            for line in result.lines:
-                for word in line.words:
-                    text = word.text.strip()
-                    if text:
-                        rect = word.bounding_rect
-                        words.append({
-                            'text': text,
-                            'x': int(rect.x),
-                            'y': int(rect.y),
-                            'width': int(rect.width),
-                            'height': int(rect.height),
-                            'center_x': int(rect.x + rect.width / 2),
-                            'center_y': int(rect.y + rect.height / 2),
-                        })
-        return words
-    except Exception as e:
-        print(f"  [DEBUG] OCR-Fehler: {e}")
-        return []
-
-
-def ocr_image(engine, img_path):
-    """Synchronous wrapper for OCR."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(ocr_image_async(engine, img_path))
-    finally:
-        loop.close()
-
-
-def find_text_in_region(engine, region_bbox, search_text, take_topmost=True, scale_factor=2):
-    """
-    Search for text in a region using OCR.
-    Returns (abs_x, abs_y, word_info) or None.
-
-    WICHTIG: OCR-Koordinaten sind in SCALED space, müssen aber zurück zu ABSOLUTE screen coords!
-    """
-    left, top, right, bottom = region_bbox
-    region_width = right - left
-    region_height = bottom - top
-
-    # Screenshot the region
-    img = ImageGrab.grab(bbox=(left, top, right, bottom))
-    original_width = img.width
-    original_height = img.height
-
-    # Scale up for better OCR recognition
-    if scale_factor > 1:
-        new_width = img.width * scale_factor
-        new_height = img.height * scale_factor
-        img = img.resize((new_width, new_height), resample=Image.LANCZOS)
-
-    temp_path = Path.cwd() / "_temp_ocr.png"
-    img.save(temp_path)
-
-    # Run OCR (returns coords in SCALED space - pixel coords of scaled image)
-    words = ocr_image(engine, temp_path)
-
-    # Search for text
-    search_lower = search_text.lower()
-    matches = [w for w in words if search_lower in w['text'].lower()]
-
-    # Cleanup
-    try:
-        temp_path.unlink()
-    except:
-        pass
-
-    if not matches:
-        return None
-
-    # Sort by Y position (topmost first)
-    matches_sorted = sorted(matches, key=lambda w: w['y'])
-
-    if take_topmost:
-        best_match = matches_sorted[0]
-    else:
-        best_match = matches_sorted[-1]
-
-    # CRITICAL: Convert from SCALED image coords back to ORIGINAL region coords, then to ABSOLUTE screen coords
-    # OCR coords are in the SCALED image (e.g. 2x), so divide by scale_factor first
-    relative_x = int(best_match['center_x'] / scale_factor)  # Back to original region size
-    relative_y = int(best_match['center_y'] / scale_factor)
-
-    # Now add the region offset to get absolute screen coordinates
-    abs_x = left + relative_x
-    abs_y = top + relative_y
-
-    return (abs_x, abs_y, best_match)
-
-
-# ============================================================
 # Kindle Window Control
 # ============================================================
-
-# Global pywinauto window reference
-_kindle_pywinauto = None
 
 def _get_window_class(hwnd):
     """Get Win32 window class name for a hwnd."""
@@ -375,71 +157,6 @@ def get_kindle_window():
     return kindle_windows[0]
 
 
-def get_kindle_window_pywinauto():
-    """Find main Kindle window with pywinauto for reliable clicking.
-    Skips WebView2 child windows by picking the largest visible window."""
-    global _kindle_pywinauto
-
-    try:
-        import ctypes
-
-        # Find the Kindle window hwnd via get_kindle_window()
-        kindle_gw = get_kindle_window()
-        if not kindle_gw:
-            return None, None
-
-        kindle_hwnd = kindle_gw._hWnd
-
-        # Get the process ID from the hwnd
-        pid = ctypes.c_ulong()
-        ctypes.windll.user32.GetWindowThreadProcessId(kindle_hwnd, ctypes.byref(pid))
-        kindle_pid = pid.value
-
-        # Connect pywinauto via process ID (avoids ambiguity error)
-        app = Application(backend='uia').connect(process=kindle_pid, timeout=5)
-
-        # Find the main window matching our hwnd
-        all_windows = app.windows()
-        kindle_window = None
-        for w in all_windows:
-            try:
-                if w.handle == kindle_hwnd:
-                    kindle_window = w
-                    break
-            except Exception:
-                continue
-
-        if not kindle_window:
-            # Fallback: pick the largest
-            best = None
-            best_area = 0
-            for w in all_windows:
-                try:
-                    rect = w.rectangle()
-                    area = rect.width() * rect.height()
-                    if area > best_area:
-                        best = w
-                        best_area = area
-                except Exception:
-                    continue
-            kindle_window = best
-
-        if not kindle_window:
-            return None, None
-
-        kindle_window.set_focus()
-        time.sleep(0.3)
-
-        rect = kindle_window.rectangle()
-        bounds = (rect.left, rect.top, rect.width(), rect.height())
-
-        _kindle_pywinauto = kindle_window
-        return kindle_window, bounds
-    except Exception as e:
-        print(f"  [WARNUNG] pywinauto: {e}")
-        return None, None
-
-
 def activate_and_get_kindle():
     """Activate Kindle window and return (left, top, width, height)."""
     kindle = get_kindle_window()
@@ -454,127 +171,175 @@ def activate_and_get_kindle():
 
 
 def exit_fullscreen_and_minimize():
-    """Focus Kindle, send ESC to exit fullscreen, then minimize."""
+    """Exit fullscreen (F11) and minimize Kindle."""
     kindle = get_kindle_window()
     if kindle:
         try:
             kindle.activate()
             time.sleep(0.3)
-            pyautogui.press('escape')
+            pyautogui.press('f11')  # leave fullscreen reading mode
             time.sleep(0.5)
             kindle.minimize()
             print("[INFO] Kindle minimiert")
         except Exception as e:
             print(f"[WARNUNG] Konnte Kindle nicht minimieren: {e}")
 
-def click_at(x, y, show_indicator=True):
-    """Click at absolute position with optional visual indicator.
-    Uses moveTo + click pattern for reliable menu clicks."""
-    if show_indicator:
-        show_click_indicator(x, y)
-        time.sleep(0.3)
 
-    # Move mouse first, then click (more reliable for menus)
-    pyautogui.moveTo(x, y, duration=0.01)
-    time.sleep(0.1)
+# ============================================================
+# Kindle Hotkey Navigation (new WinUI Kindle - no menu bar)
+# ============================================================
+# The new Kindle for PC is a WinUI-3 app; the reader lives inside a
+# Microsoft.UI.Content.DesktopChildSiteBridge child window. Both F11 (fullscreen)
+# and the page keys (PageDown/PageUp) only work when that reader has keyboard
+# focus, and the only reliable way to give it focus is a single left-click in the
+# reading area. So the flow is: click ONCE to focus the reader, then F11 to go
+# fullscreen. Entering fullscreen resets to a clean page - the click's toolbar
+# chrome does NOT carry into fullscreen (only a transient 'Drücke F11' hint shows,
+# which fades) - so captures via PrintWindow are clean. After that we navigate
+# with keys only and keep the mouse parked in a neutral spot, so no further chrome
+# appears. We do NOT use Ctrl+G to jump to a page: its dialog steals the reader's
+# focus, which then kills the page keys. All verified live 2026-07-19.
 
-    if show_indicator:
-        hide_click_indicator()
-        time.sleep(0.1)
-
-    pyautogui.click(x, y)
-    time.sleep(0.3)
-
-
-def click_kindle(x_percent, y_percent, show_indicator=True):
-    """Click at position relative to Kindle window (0-1 for x and y)."""
-    bounds = activate_and_get_kindle()
-    if bounds:
-        left, top, width, height = bounds
-        abs_x = left + int(width * x_percent)
-        abs_y = top + int(height * y_percent)
-        click_at(abs_x, abs_y, show_indicator)
-        return True
-    return False
-
-
-# Global arrow positions (detected once from title page)
-ARROW_RIGHT_POS = None
-ARROW_LEFT_POS = None
-
-
-def detect_arrow_positions(book_region=None):
-    """Detect arrow positions by hovering over margins to make arrows visible."""
-    global ARROW_RIGHT_POS, ARROW_LEFT_POS
-
-    print("[INFO] Suche Navigationspfeile...")
-
+def park_mouse_center():
+    """Move (NOT click) the mouse to a neutral spot in the middle of the reading
+    area, away from the side arrows / top toolbar / bottom slider, so no
+    hover-chrome appears. Moving the mouse does not steal keyboard focus."""
     screen_width, screen_height = pyautogui.size()
+    pyautogui.moveTo(screen_width // 2, int(screen_height * 0.5), duration=0.1)
 
-    if not book_region:
-        print("[FEHLER] Kein Buchbereich angegeben fuer Pfeil-Erkennung!")
+
+def _is_fullscreen():
+    """True if the Kindle window currently covers (almost) the whole screen."""
+    kindle = get_kindle_window()
+    if not kindle:
+        return False
+    screen_width, screen_height = pyautogui.size()
+    return kindle.width >= screen_width * 0.98 and kindle.height >= screen_height * 0.98
+
+
+def _click_reader_center():
+    """Left-click the center of the current Kindle window to give the WinUI reader
+    keyboard focus (required for both F11 and the page keys). The center is
+    neutral - it does not turn a page. In windowed mode this briefly shows the
+    toolbar chrome, but entering fullscreen (F11) resets to a clean page."""
+    kindle = get_kindle_window()
+    if not kindle:
+        print("[FEHLER] Kindle-Fenster fuer Fokus-Klick nicht gefunden!")
         sys.exit(1)
-
-    book_left, book_top, book_right, book_bottom = book_region
-    # Right margin: between book right edge and screen edge
-    right_hover_x = book_right + (screen_width - book_right) // 2
-    right_hover_y = (book_top + book_bottom) // 2
-    # Left margin: between screen left and book left edge
-    left_hover_x = book_left // 2
-    left_hover_y = (book_top + book_bottom) // 2
-
-    # Find right arrow: move mouse to right margin, wait for arrow to appear
-    print(f"  Bewege Maus zum rechten Rand ({right_hover_x}, {right_hover_y})...")
-    pyautogui.moveTo(right_hover_x, right_hover_y, duration=0.1)
-    time.sleep(0.5)  # Wait for arrow to appear
-
-    # Take screenshot and find arrow
-    screenshot = ImageGrab.grab()
-    right_pos = find_arrow_button(screenshot, side='right')
-    if right_pos:
-        ARROW_RIGHT_POS = right_pos
-        print(f"  Rechter Pfeil (weiter): ({right_pos[0]}, {right_pos[1]})")
-    else:
-        print("[FEHLER] Rechter Navigationspfeil nicht gefunden!")
-        sys.exit(1)
-
-    # Find left arrow: move mouse to left margin, wait for arrow to appear
-    print(f"  Bewege Maus zum linken Rand ({left_hover_x}, {left_hover_y})...")
-    pyautogui.moveTo(left_hover_x, left_hover_y, duration=0.1)
-    time.sleep(0.5)  # Wait for arrow to appear
-
-    # Take screenshot and find arrow
-    screenshot = ImageGrab.grab()
-    left_pos = find_arrow_button(screenshot, side='left')
-    if left_pos:
-        ARROW_LEFT_POS = left_pos
-        print(f"  Linker Pfeil (zurueck): ({left_pos[0]}, {left_pos[1]})")
-    else:
-        print("[FEHLER] Linker Navigationspfeil nicht gefunden!")
-        sys.exit(1)
-
-    # Move mouse away from margins
-    pyautogui.moveTo(screen_width // 2, screen_height // 2, duration=0.1)
-
-    return ARROW_RIGHT_POS is not None
+    pyautogui.click(kindle.left + kindle.width // 2, kindle.top + kindle.height // 2)
+    time.sleep(0.5)
 
 
-def click_next_page():
-    """Click to go to next page."""
-    if not ARROW_RIGHT_POS:
-        print("[FEHLER] Rechter Pfeil wurde nicht erkannt!")
-        sys.exit(1)
-    click_at(ARROW_RIGHT_POS[0], ARROW_RIGHT_POS[1], show_indicator=True)
-    return True
+def enter_fullscreen():
+    """Enter fullscreen reading mode. F11 only toggles fullscreen when the reader
+    has keyboard focus, so we click the reader first, then press F11. If Kindle is
+    ALREADY fullscreen we normalize to windowed first (click + F11 to exit), so the
+    enter is the clean click->F11 path. Retries because a just-activated window can
+    swallow the first F11 press."""
+    print("[INFO] Aktiviere Vollbildmodus (F11)...")
+
+    activate_and_get_kindle()
+    time.sleep(0.4)
+
+    # If already fullscreen, leave it first so the enter below is the clean,
+    # focus-granting click->F11 path (F11-exit also needs the click for focus).
+    if _is_fullscreen():
+        _click_reader_center()
+        pyautogui.press('f11')
+        time.sleep(1.5)
+
+    for attempt in range(1, 4):
+        activate_and_get_kindle()
+        time.sleep(0.4)
+        if _is_fullscreen():
+            park_mouse_center()
+            print(f"[OK] Vollbildmodus aktiv (Versuch {attempt})")
+            return
+        _click_reader_center()   # give the reader focus so F11 is delivered
+        pyautogui.press('f11')
+        time.sleep(1.6)
+        if _is_fullscreen():
+            park_mouse_center()
+            print(f"[OK] Vollbildmodus aktiviert (Versuch {attempt})")
+            return
+
+    print("[FEHLER] Vollbildmodus konnte nicht aktiviert werden (F11)!")
+    sys.exit(1)
 
 
-def click_prev_page():
-    """Click to go to previous page."""
-    if not ARROW_LEFT_POS:
-        print("[FEHLER] Linker Pfeil wurde nicht erkannt!")
-        sys.exit(1)
-    click_at(ARROW_LEFT_POS[0], ARROW_LEFT_POS[1], show_indicator=True)
-    return True
+def wait_until_screen_stable(max_wait=8, interval=0.5, stable_needed=2, threshold=1.0):
+    """Wait until the screen stops changing (fullscreen transition + the transient
+    'Drücke F11 zum Beenden' hint fading). Replaces the old OCR-based hint wait
+    with a UI-independent screenshot-difference check."""
+    print("[INFO] Warte bis Bildschirm stabil...")
+    prev = grab_kindle_screenshot()
+    stable = 0
+    waited = 0.0
+    while waited < max_wait:
+        check_stop_and_exit()
+        time.sleep(interval)
+        waited += interval
+        cur = grab_kindle_screenshot()
+        if prev is not None and cur is not None and prev.size == cur.size:
+            a = np.asarray(prev, dtype=np.float32)
+            b = np.asarray(cur, dtype=np.float32)
+            d = float(np.mean(np.abs(a - b)))
+        else:
+            d = 999.0
+        prev = cur
+        if d <= threshold:
+            stable += 1
+            if stable >= stable_needed:
+                print(f"[OK] Bildschirm stabil nach {waited:.1f}s")
+                return
+        else:
+            stable = 0
+    print("[WARNUNG] Timeout beim Warten auf stabilen Bildschirm - fahre fort")
+
+
+def go_to_book_start():
+    """Navigate to the very beginning of the book (the cover) by pressing PageUp
+    until the page stops changing.
+
+    Relies on the reader already having keyboard focus (from the click in
+    enter_fullscreen), so PageUp is delivered. We deliberately do NOT use Ctrl+G
+    here: its dialog steals that focus. PageUp walks back through any front matter
+    to the cover; since the whole book is paged through afterwards anyway, the
+    extra presses are cheap."""
+    print("[INFO] Navigiere zum Buchanfang (Cover) per PageUp...")
+    park_mouse_center()
+
+    last = grab_kindle_screenshot()
+    no_change = 0
+    MAX_PAGEUP = 600
+    for i in range(MAX_PAGEUP):
+        check_stop_and_exit()
+        pyautogui.press('pageup')
+        time.sleep(WAIT_AFTER_PAGE)
+        cur = grab_kindle_screenshot()
+        if images_are_similar(cur, last):
+            no_change += 1
+            if no_change >= 3:
+                print(f"  [OK] Cover erreicht (nach {i + 1} PageUp)")
+                return
+        else:
+            no_change = 0
+        last = cur
+
+    print("[WARNUNG] Cover nach max. PageUp nicht sicher erreicht - fahre fort")
+
+
+def press_next_page():
+    """Turn to the next page (PageDown). Relies on the reader keeping the keyboard
+    focus it got from the click in enter_fullscreen."""
+    pyautogui.press('pagedown')
+
+
+def press_prev_page():
+    """Turn to the previous page (PageUp). Relies on the reader keeping the keyboard
+    focus it got from the click in enter_fullscreen."""
+    pyautogui.press('pageup')
+
 
 # ============================================================
 # Kindle Preparation (Find, Navigate, Fullscreen)
@@ -658,622 +423,96 @@ def find_and_activate_kindle():
     return True
 
 
-def click_menu_item(menu_name, item_text, timeout=5):
-    """Click a menu item in Kindle by searching for text."""
-    bounds = activate_and_get_kindle()
-    if not bounds:
-        return False
-
-    left, top, width, height = bounds
-
-    # Menu bar is at the top of the window
-    # "Gehe zu" is typically around 150-200px from left
-    menu_positions = {
-        'Gehe zu': 0.15,  # ~15% from left
-    }
-
-    if menu_name in menu_positions:
-        menu_x = menu_positions[menu_name]
-        # Click on menu (menu bar is about 60px from top of window)
-        abs_x = left + int(width * menu_x)
-        abs_y = top + 62  # Menu bar height
-        pyautogui.click(abs_x, abs_y)
-        time.sleep(0.5)
-        return True
-    return False
-
-
-def open_goto_menu():
-    """Open the 'Gehe zu' menu in Kindle."""
-    print("[INFO] Oeffne 'Gehe zu' Menu...")
-    bounds = activate_and_get_kindle()
-    if not bounds:
-        return False
-
-    left, top, width, height = bounds
-
-    # "Gehe zu" menu position (approximately)
-    # Based on screenshot: around 300px from left on a typical window
-    abs_x = left + 300
-    abs_y = top + 100  # Menu bar area
-
-    pyautogui.click(abs_x, abs_y)
-    time.sleep(0.5)
-    return True
-
-
-def find_image_on_screen(template_path, region=None, confidence=0.8):
-    """Find an image on screen and return its center coordinates."""
-    try:
-        location = pyautogui.locateOnScreen(template_path, region=region, confidence=confidence)
-        if location:
-            center = pyautogui.center(location)
-            return (center.x, center.y)
-    except Exception as e:
-        print(f"  [DEBUG] Bilderkennung fehlgeschlagen: {e}")
-    return None
-
-
-def find_icon_in_toolbar(icon_name, bounds):
-    """Find an icon in the Kindle toolbar by template matching."""
-    left, top, width, height = bounds
-
-    # Search only in toolbar area (top 130px)
-    toolbar_region = (left, top, width, 130)
-
-    script_dir = Path(__file__).parent if not getattr(sys, 'frozen', False) else Path(sys.executable).parent
-    template_path = script_dir / "templates" / f"{icon_name}.png"
-
-    if template_path.exists():
-        pos = find_image_on_screen(str(template_path), region=toolbar_region, confidence=0.7)
-        if pos:
-            return pos
-
-    return None
-
-
-def navigate_to_title_page():
-    """Navigate to title page using 'Gehe zu' -> 'Titelseite' via OCR."""
-    print("[INFO] Navigiere zur Titelseite...")
-
-    engine = get_ocr_engine()
-    if not engine:
-        print("[FEHLER] Windows OCR nicht verfuegbar!")
-        sys.exit(1)
-
-    kindle_window, bounds = get_kindle_window_pywinauto()
-    if not kindle_window or not bounds:
-        print("[FEHLER] pywinauto konnte Kindle-Fenster nicht finden!")
-        sys.exit(1)
-
-    win_left, win_top, win_width, win_height = bounds
-    print(f"  Fenster: left={win_left}, top={win_top}, width={win_width}, height={win_height}")
-
-    # Step 1: Find "Gehe zu" in menu bar via OCR
-    print("  Suche 'Gehe zu' im Hauptmenue...")
-    menu_region = (win_left, win_top - 5, win_left + win_width, win_top + 30)
-    result = find_text_in_region(engine, menu_region, "Gehe", take_topmost=True)
-
-    if not result:
-        print("[FEHLER] 'Gehe zu' nicht im Menue gefunden!")
-        sys.exit(1)
-
-    goto_x, goto_y, goto_info = result
-    print(f"  'Gehe zu' gefunden bei ({goto_x}, {goto_y})")
-
-    # Step 2: Click on "Gehe zu"
-    click_at(goto_x, goto_y)
-    time.sleep(0.8)
-
-    # Step 3: Find "Titelseite" in dropdown via OCR
-    # Dropdown can be wide and tall - search a generous region below the menu click
-    print("  Suche 'Titelseite' im Dropdown...")
-    dropdown_region = (
-        max(0, goto_x - 100),
-        goto_y + 5,
-        goto_x + 300,
-        goto_y + 400
-    )
-
-    # Debug: show all OCR words found in dropdown region
-    temp_img = ImageGrab.grab(bbox=dropdown_region)
-    temp_path = Path.cwd() / "_temp_dropdown_debug.png"
-    scale = 2
-    temp_img_scaled = temp_img.resize((temp_img.width * scale, temp_img.height * scale), resample=Image.LANCZOS)
-    temp_img_scaled.save(temp_path)
-    debug_words = ocr_image(engine, temp_path)
-    try:
-        temp_path.unlink()
-    except:
-        pass
-    if debug_words:
-        print(f"  [DEBUG] OCR fand {len(debug_words)} Woerter im Dropdown:")
-        for w in debug_words:
-            print(f"    '{w['text']}' bei ({w['center_x']//scale}, {w['center_y']//scale})")
-    else:
-        print("  [DEBUG] OCR fand KEINE Woerter im Dropdown!")
-
-    # Try multiple search terms (DE and EN)
-    result = None
-    for search_term in ["Titelseite", "Titel", "Cover", "Anfang", "Beginning"]:
-        result = find_text_in_region(engine, dropdown_region, search_term, take_topmost=True)
-        if result:
-            print(f"  Gefunden mit Suchbegriff: '{search_term}'")
-            break
-
-    if not result:
-        print("[FEHLER] Kein passender Eintrag im Dropdown gefunden!")
-        pyautogui.press('escape')
-        sys.exit(1)
-
-    title_x, title_y, title_info = result
-    print(f"  'Titelseite' gefunden bei ({title_x}, {title_y})")
-
-    # Step 4: Click on "Titelseite"
-    click_at(title_x, title_y)
-    time.sleep(1.0)
-
-    print("[OK] Zur Titelseite navigiert")
-    return True
-
-
-def click_fullscreen_button():
-    """Click the fullscreen button via Ansicht -> Vollbildmodus menu."""
-    print("[INFO] Aktiviere Vollbildmodus...")
-
-    engine = get_ocr_engine()
-    if not engine:
-        print("[FEHLER] Windows OCR nicht verfuegbar!")
-        sys.exit(1)
-
-    kindle_window, bounds = get_kindle_window_pywinauto()
-    if not kindle_window or not bounds:
-        print("[FEHLER] pywinauto konnte Kindle-Fenster nicht finden!")
-        sys.exit(1)
-
-    win_left, win_top, win_width, win_height = bounds
-
-    # Step 1: Find "Ansicht" in menu bar via OCR
-    print("  Suche 'Ansicht' im Hauptmenue...")
-    menu_region = (win_left, win_top - 5, win_left + win_width, win_top + 30)
-    result = find_text_in_region(engine, menu_region, "Ansicht", take_topmost=True)
-
-    if not result:
-        print("[FEHLER] 'Ansicht' nicht im Menue gefunden!")
-        sys.exit(1)
-
-    ansicht_x, ansicht_y, ansicht_info = result
-    print(f"  'Ansicht' gefunden bei ({ansicht_x}, {ansicht_y})")
-
-    # Step 2: Click on "Ansicht"
-    click_at(ansicht_x, ansicht_y)
-    time.sleep(0.8)
-
-    # Step 3: Find "Vollbildmodus" in dropdown via OCR
-    print("  Suche 'Vollbildmodus' im Dropdown...")
-    dropdown_region = (
-        ansicht_x - 30,
-        ansicht_y + 5,
-        ansicht_x + 250,
-        ansicht_y + 250
-    )
-    result = find_text_in_region(engine, dropdown_region, "Vollbild", take_topmost=True)
-
-    if not result:
-        print("[FEHLER] 'Vollbildmodus' nicht im Dropdown gefunden!")
-        pyautogui.press('escape')
-        sys.exit(1)
-
-    vollbild_x, vollbild_y, vollbild_info = result
-    print(f"  'Vollbildmodus' gefunden bei ({vollbild_x}, {vollbild_y})")
-
-    # Step 4: Click on "Vollbildmodus"
-    click_at(vollbild_x, vollbild_y)
-    time.sleep(1.0)
-
-    # Switch to fullscreen mode
-    set_fullscreen_mode(True)
-
-    print("[OK] Vollbildmodus aktiviert")
-    return True
-
-
-def wait_for_fullscreen_message_to_disappear():
-    """Wait until the 'Press F11 to exit' message disappears using OCR."""
-    print("[INFO] Warte bis Vollbild-Hinweis verschwindet...")
-
-    engine = get_ocr_engine()
-    if not engine:
-        print("[FEHLER] Windows OCR nicht verfuegbar!")
-        sys.exit(1)
-
-    max_wait = 10  # max seconds to wait
-    check_interval = 0.5
-
-    screen_width, screen_height = pyautogui.size()
-
-    for i in range(int(max_wait / check_interval)):
-        check_stop_and_exit()
-
-        # Check center region where the message appears
-        center_region = (
-            screen_width // 2 - 200,
-            screen_height // 2 - 50,
-            screen_width // 2 + 200,
-            screen_height // 2 + 50
-        )
-
-        result = find_text_in_region(engine, center_region, "Beenden", take_topmost=True, scale_factor=2)
-
-        if result is None:
-            print(f"[OK] Vollbild-Hinweis verschwunden nach {(i+1) * check_interval:.1f}s")
-            return True
-
-        time.sleep(check_interval)
-
-    print("[WARNUNG] Timeout beim Warten auf Vollbild-Hinweis")
-    return True  # Continue anyway
-
-
 def prepare_kindle_for_capture():
-    """Complete preparation sequence: find window, goto title, fullscreen.
-    Returns the detected book region or None on failure."""
+    """Complete preparation sequence (hotkey-based, new WinUI Kindle):
+    find window -> fullscreen (F11) -> go to cover. Returns the capture region
+    (the full fullscreen page) or None on failure.
+
+    We capture the whole fullscreen page rather than trying to crop the content:
+    in clean fullscreen the page has only a small, uniform margin, the cover is
+    letterboxed, and per-page margin detection proved unreliable. The downstream
+    OCR (create_pdf / create_markdown) ignores the margins anyway."""
     print()
-    print("[SCHRITT 1/6] Kindle-Fenster finden...")
+    print("[SCHRITT 1/3] Kindle-Fenster finden...")
     if not find_and_activate_kindle():
         return None
 
     time.sleep(0.5)
 
     print()
-    print("[SCHRITT 2/6] Zur Titelseite navigieren...")
-    navigate_to_title_page()  # Bricht bei Fehler mit sys.exit(1) ab
-
-    time.sleep(0.5)
-
-    print()
-    print("[SCHRITT 3/6] Vollbildmodus aktivieren...")
-    click_fullscreen_button()  # Bricht bei Fehler mit sys.exit(1) ab
+    print("[SCHRITT 2/3] Vollbildmodus aktivieren (F11)...")
+    enter_fullscreen()  # Bricht bei Fehler mit sys.exit(1) ab
+    wait_until_screen_stable()
 
     print()
-    print("[SCHRITT 4/6] Warte auf Vollbildmodus...")
-    wait_for_fullscreen_message_to_disappear()
+    print("[SCHRITT 3/3] Zum Buchanfang (Cover) navigieren...")
+    go_to_book_start()
+    wait_until_screen_stable(max_wait=4)
 
-    # Extra wait to ensure everything is stable
-    time.sleep(1.0)
-
-    print()
-    print("[SCHRITT 5/6] Erkenne Buchbereich...")
     screenshot = grab_kindle_screenshot()
     if screenshot is None:
         print("[FEHLER] Konnte Screenshot nicht erstellen!")
         sys.exit(1)
 
     screen_width, screen_height = screenshot.size
-
-    # In fullscreen: top=0, bottom=screen_height (always full height)
-    # Only left/right margins need to be detected from title page
-    print("[INFO] Erkenne linken/rechten Rand von Titelseite...")
-    title_region = detect_book_region_from_title_page(screenshot)  # Bricht bei Fehler ab
-
-    t_left, _, t_right, _ = title_region
-
-    # Use full screen height, only crop left/right
-    book_region = (t_left, 0, t_right, screen_height)
-    print(f"[OK] Buchbereich: ({t_left}, 0) bis ({t_right}, {screen_height})")
-    print(f"     Groesse: {t_right - t_left} x {screen_height} Pixel")
-
-    print()
-    print("[SCHRITT 6/6] Erkenne Navigationspfeile...")
-    detect_arrow_positions(book_region)
+    book_region = (0, 0, screen_width, screen_height)
+    print(f"[OK] Erfassungsbereich (Vollbild): {screen_width} x {screen_height} Pixel")
 
     print()
     print("[OK] Kindle bereit fuer Erfassung!")
     return book_region
 
-# Global flag to indicate fullscreen mode
-FULLSCREEN_MODE = False
-FULLSCREEN_BOUNDS = None
+def _grab_window_printwindow(hwnd):
+    """Capture a window's pixels via PrintWindow(PW_RENDERFULLCONTENT=2). This
+    reads the window's own rendering (WinUI + WebView2 content), so it works even
+    when the Kindle fullscreen is in an exclusive/protected mode that makes GDI
+    screen grab fail or return black. Returns a PIL Image, or None on failure."""
+    import ctypes
 
-def grab_kindle_screenshot():
-    """Take screenshot of Kindle window or fullscreen."""
-    global FULLSCREEN_MODE, FULLSCREEN_BOUNDS
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0:
+        return None
 
-    if FULLSCREEN_MODE:
-        # In fullscreen, grab the whole screen or cached bounds
-        if FULLSCREEN_BOUNDS:
-            left, top, width, height = FULLSCREEN_BOUNDS
-            return ImageGrab.grab(bbox=(left, top, left + width, top + height))
-        else:
-            return ImageGrab.grab()
+    hwnd_dc = win32gui.GetWindowDC(hwnd)
+    mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+    save_dc = mfc_dc.CreateCompatibleDC()
+    bitmap = win32ui.CreateBitmap()
+    bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+    save_dc.SelectObject(bitmap)
+    try:
+        # PW_RENDERFULLCONTENT = 2 -> include DirectComposition / WebView2 content
+        result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+        info = bitmap.GetInfo()
+        bits = bitmap.GetBitmapBits(True)
+        img = Image.frombuffer('RGB', (info['bmWidth'], info['bmHeight']),
+                               bits, 'raw', 'BGRX', 0, 1)
+    finally:
+        win32gui.DeleteObject(bitmap.GetHandle())
+        save_dc.DeleteDC()
+        mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
 
-    # Normal window mode
-    bounds = activate_and_get_kindle()
-    if bounds:
-        left, top, width, height = bounds
-        return ImageGrab.grab(bbox=(left, top, left + width, top + height))
+    return img if result == 1 else None
+
+
+def grab_kindle_screenshot(retries=4, delay=0.2):
+    """Capture the current Kindle window (the reading page) via PrintWindow.
+    Returns a PIL Image, or None if the window is gone / capture keeps failing."""
+    kindle = get_kindle_window()
+    if not kindle:
+        return None
+    hwnd = kindle._hWnd
+    for _ in range(retries):
+        img = _grab_window_printwindow(hwnd)
+        if img is not None:
+            return img
+        time.sleep(delay)
     return None
-
-
-def set_fullscreen_mode(enabled, bounds=None):
-    """Set fullscreen mode and optionally cache screen bounds."""
-    global FULLSCREEN_MODE, FULLSCREEN_BOUNDS
-    FULLSCREEN_MODE = enabled
-    FULLSCREEN_BOUNDS = bounds
 
 # ============================================================
 # Image Analysis
 # ============================================================
-
-def detect_background_color(screenshot):
-    """Detect if background is dark or light."""
-    img_array = np.array(screenshot)
-    if len(img_array.shape) == 3:
-        gray = np.mean(img_array[:, :, :3], axis=2)
-    else:
-        gray = img_array
-
-    height, width = gray.shape
-    samples = [
-        gray[10, 10],
-        gray[10, width-10],
-        gray[height-10, 10],
-        gray[height-10, width-10],
-    ]
-    avg_corner = np.mean(samples)
-    return 'dark' if avg_corner < 128 else 'light'
-
-
-def find_arrow_button(screenshot, side='right'):
-    """Find the gray navigation arrow button on the margin.
-
-    The arrow is a gray ">" or "<" symbol on the black/white margin.
-    Returns (x, y) position of the arrow center, or None if not found.
-
-    Args:
-        screenshot: PIL Image of the screen
-        side: 'right' for next page arrow, 'left' for previous page arrow
-    """
-    img_array = np.array(screenshot)
-    if len(img_array.shape) == 3:
-        gray = img_array[:, :, :3].mean(axis=2).astype(np.uint8)
-    else:
-        gray = img_array
-
-    height, width = gray.shape
-
-    # Determine margin brightness (black ~0 or white ~255)
-    if side == 'right':
-        margin_strip = gray[height//4:3*height//4, width-30:width]
-    else:
-        margin_strip = gray[height//4:3*height//4, 0:30]
-
-    margin_brightness = np.mean(margin_strip)
-    is_dark_margin = margin_brightness < 128
-
-    # The arrow is a light gray (~200-230) on white background or darker gray on black
-    # We need to detect subtle differences
-
-    if side == 'right':
-        # Search in the right margin area (last 20% of width, excluding edge)
-        search_left = int(width * 0.80)
-        search_right = width - 5
-    else:
-        # Search in the left margin area (first 20% of width, excluding edge)
-        search_left = 5
-        search_right = int(width * 0.20)
-
-    # Search vertically in the middle 60% of height
-    search_top = int(height * 0.20)
-    search_bottom = int(height * 0.80)
-
-    # Extract the search region
-    search_region = gray[search_top:search_bottom, search_left:search_right].astype(float)
-
-    # Calculate local variance to find the arrow (edges have higher variance)
-    # Use a simple gradient approach: find vertical edges
-    # The arrow ">" has strong vertical gradients
-
-    # Calculate horizontal gradient (difference between adjacent columns)
-    gradient = np.abs(np.diff(search_region, axis=1))
-
-    # The arrow should have gradients in the middle vertically
-    # Find columns with significant gradients
-    col_gradient_sum = np.sum(gradient, axis=0)
-
-    # Find the column with maximum gradient (this is where the arrow edge is)
-    if len(col_gradient_sum) == 0:
-        print(f"  [DEBUG] Kein Gradient auf {side} Seite")
-        return None
-
-    max_gradient_col = np.argmax(col_gradient_sum)
-    max_gradient_value = col_gradient_sum[max_gradient_col]
-
-    # Check if gradient is significant
-    mean_gradient = np.mean(col_gradient_sum)
-    if max_gradient_value < mean_gradient * 2:
-        print(f"  [DEBUG] Kein signifikanter Gradient auf {side} Seite (max={max_gradient_value:.0f}, mean={mean_gradient:.0f})")
-        return None
-
-    # Find the vertical center of the gradient in that column
-    col_gradients = gradient[:, max_gradient_col]
-    gradient_indices = np.where(col_gradients > np.mean(col_gradients) * 2)[0]
-
-    if len(gradient_indices) == 0:
-        print(f"  [DEBUG] Keine Gradient-Positionen auf {side} Seite")
-        return None
-
-    # Calculate center of arrow
-    center_y_local = int(np.mean(gradient_indices))
-    center_x_local = max_gradient_col
-
-    # Convert back to full image coordinates
-    abs_x = search_left + center_x_local
-    abs_y = search_top + center_y_local
-
-    print(f"  Pfeil gefunden bei ({abs_x}, {abs_y}) - Gradient: {max_gradient_value:.0f}")
-
-    return (abs_x, abs_y)
-
-def detect_book_region_from_title_page(screenshot):
-    """Detect book region from title page.
-
-    Uses variance-based detection: the book content has pixel variation (text, images),
-    while uniform margins (black or white) have near-zero variance.
-    """
-    img_array = np.array(screenshot)
-    if len(img_array.shape) == 3:
-        gray = np.mean(img_array[:, :, :3], axis=2)
-    else:
-        gray = img_array.astype(float)
-
-    height, width = gray.shape
-
-    # Get margin info for debugging
-    margin_brightness = np.mean([gray[height//2, 5], gray[height//2, width-5]])
-    print(f"  Margin-Helligkeit: {margin_brightness:.0f}")
-
-    # Calculate variance for each column - content columns have higher variance
-    # Use a sliding window to smooth out noise
-    # Use full height (5%-95%) to catch title text, images and other content near edges
-    scan_top = int(height * 0.05)
-    scan_bottom = int(height * 0.95)
-    col_variance = np.zeros(width)
-    for col in range(width):
-        col_variance[col] = np.var(gray[scan_top:scan_bottom, max(0,col-2):min(width,col+3)])
-
-    # Find threshold: margins have very low variance, content has higher
-    max_variance = np.max(col_variance)
-    variance_threshold = max_variance * 0.05  # 5% of max variance indicates content
-
-    print(f"  Max Varianz: {max_variance:.0f}, Schwelle: {variance_threshold:.0f}")
-
-    # Find left edge - first column with significant variance
-    left = 0
-    for col in range(width // 2):
-        if col_variance[col] > variance_threshold:
-            left = col
-            break
-
-    # Find right edge - last column with significant variance
-    right = width
-    for col in range(width - 1, width // 2, -1):
-        if col_variance[col] > variance_threshold:
-            right = col + 1
-            break
-
-    # Calculate row variance for top/bottom detection
-    row_variance = np.zeros(height)
-    for row in range(height):
-        row_variance[row] = np.var(gray[max(0,row-2):min(height,row+3), left:right])
-
-    row_variance_threshold = np.max(row_variance) * 0.05
-
-    # Find top edge
-    top = 0
-    for row in range(height // 2):
-        if row_variance[row] > row_variance_threshold:
-            top = row
-            break
-
-    # Find bottom edge
-    bottom = height
-    for row in range(height - 1, height // 2, -1):
-        if row_variance[row] > row_variance_threshold:
-            bottom = row + 1
-            break
-
-    book_width = right - left
-    book_height = bottom - top
-
-    print(f"  Erkannte Grenzen: left={left}, right={right}, top={top}, bottom={bottom}")
-    print(f"  Buchgroesse: {book_width} x {book_height}")
-
-    # Validate: book should be reasonable size
-    if book_width > width * 0.2 and book_height > height * 0.3:
-        return (left, top, right, bottom)
-
-    print("[FEHLER] Buchbereich konnte nicht erkannt werden!")
-    print(f"  Erkannte Groesse: {book_width} x {book_height} (zu klein)")
-    sys.exit(1)
-
-def margin_and_book_same_color(screenshot):
-    """Check if margin and book content have similar colors."""
-    img_array = np.array(screenshot)
-    if len(img_array.shape) == 3:
-        gray = np.mean(img_array[:, :, :3], axis=2)
-    else:
-        gray = img_array
-
-    height, width = gray.shape
-
-    margin_samples = [
-        gray[10, 10],
-        gray[10, width-10],
-        gray[height-10, 10],
-        gray[height-10, width-10],
-    ]
-    margin_color = np.mean(margin_samples)
-
-    center_y = height // 2
-    center_x = width // 2
-    center_samples = [
-        gray[center_y-50:center_y+50, center_x-50:center_x+50].mean()
-    ]
-    center_color = np.mean(center_samples)
-
-    threshold = 50
-    return abs(margin_color - center_color) < threshold
-
-def find_text_bounds(screenshot):
-    """Find the text region by detecting text pixels."""
-    img_array = np.array(screenshot)
-
-    if len(img_array.shape) == 3:
-        gray = np.mean(img_array[:, :, :3], axis=2)
-    else:
-        gray = img_array
-
-    height, width = gray.shape
-
-    bg_type = detect_background_color(screenshot)
-
-    if bg_type == 'dark':
-        has_text = lambda arr: np.max(arr) > 50
-    else:
-        has_text = lambda arr: np.min(arr) < 200
-
-    top_section = int(height * 0.1)
-    bottom_section = int(height * 0.9)
-    # Use middle section for left/right detection to avoid window chrome/taskbar
-    mid_top = int(height * 0.2)
-    mid_bottom = int(height * 0.8)
-
-    left = 0
-    for col in range(width):
-        if has_text(gray[mid_top:mid_bottom, col]):
-            left = col
-            break
-
-    right = width
-    for col in range(width - 1, -1, -1):
-        if has_text(gray[mid_top:mid_bottom, col]):
-            right = col + 1
-            break
-
-    top = 0
-    for row in range(height):
-        if has_text(gray[row, left:right]):
-            top = row
-            break
-
-    bottom = height
-    for row in range(height - 1, -1, -1):
-        if has_text(gray[row, left:right]):
-            bottom = row + 1
-            break
-
-    return (left, top, right, bottom)
 
 def images_are_similar(img1, img2, threshold=0.99):
     """Compare two images and return True if they are very similar."""
@@ -1292,119 +531,6 @@ def images_are_similar(img1, img2, threshold=0.99):
     return similarity > threshold
 
 # ============================================================
-# Book Region Calibration
-# ============================================================
-
-def calibrate_book_region(max_pages_to_search=50, consecutive_matches_needed=3, tolerance=20):
-    """Detect book region."""
-    screenshot = grab_kindle_screenshot()
-    if screenshot is None:
-        print("[FEHLER] Konnte Kindle-Screenshot nicht erstellen!")
-        return None
-
-    screen_width, screen_height = screenshot.size
-
-    if not margin_and_book_same_color(screenshot):
-        print("[INFO] Erkenne Buchbereich von Titelseite...")
-        region = detect_book_region_from_title_page(screenshot)
-        if region:
-            left, top, right, bottom = region
-            print(f"[OK] Buchbereich erkannt: ({left}, {top}, {right}, {bottom})")
-            return region
-        print("[INFO] Direkte Erkennung fehlgeschlagen, wechsle zu Seitensuche...")
-
-    print(f"[INFO] Suche nach {consecutive_matches_needed} aufeinanderfolgenden Seiten mit gleichem rechten Rand...")
-
-    min_left = 99999
-    min_top = 99999
-    max_bottom = 0
-    pages_navigated = 0
-
-    recent_right_edges = []
-    found_stable_right = False
-    stable_right_edge = 0
-    full_width_count = 0  # Count pages that extend to full width
-
-    for i in range(max_pages_to_search):
-        check_stop_and_exit()
-
-        time.sleep(0.3)
-        screenshot = grab_kindle_screenshot()
-        if screenshot is None:
-            print("[FEHLER] Konnte Kindle-Screenshot nicht erstellen!")
-            return None
-
-        bounds = find_text_bounds(screenshot)
-        left, top, right, bottom = bounds
-
-        min_left = min(min_left, left)
-        min_top = min(min_top, top)
-        max_bottom = max(max_bottom, bottom)
-
-        # Track all right edges, including full-width ones
-        recent_right_edges.append(right)
-
-        # Check if this is a full-width page (no visible right margin)
-        is_full_width = right >= screen_width * 0.9
-        if is_full_width:
-            full_width_count += 1
-            print(f"  Seite +{i+1}: rechter Rand = {right} (Vollbreite)")
-        else:
-            print(f"  Seite +{i+1}: rechter Rand = {right}")
-
-        # Check for stable right edge (3 consecutive similar values)
-        if len(recent_right_edges) >= consecutive_matches_needed:
-            last_edges = recent_right_edges[-consecutive_matches_needed:]
-            min_edge = min(last_edges)
-            max_edge = max(last_edges)
-
-            if max_edge - min_edge <= tolerance:
-                stable_right_edge = max(last_edges)
-                found_stable_right = True
-                print(f"  --> Stabiler Rand gefunden: {stable_right_edge}")
-                pages_navigated = i + 1
-                break
-
-        click_next_page()
-        time.sleep(0.5)
-        pages_navigated = i + 1
-
-    if not found_stable_right:
-        # If most pages were full-width, use full screen width
-        if full_width_count >= pages_navigated * 0.7:
-            print("[INFO] Buch nutzt volle Bildschirmbreite (keine sichtbaren Raender)")
-            stable_right_edge = screen_width
-        elif recent_right_edges:
-            # Use the most common right edge
-            stable_right_edge = max(recent_right_edges)
-            print(f"[INFO] Verwende maximalen rechten Rand: {stable_right_edge}")
-        else:
-            stable_right_edge = int(screen_width * 0.6)
-            print(f"[WARNUNG] Kein Rand gefunden, verwende Schaetzung: {stable_right_edge}")
-
-    padding = 20
-    screenshot = grab_kindle_screenshot()
-    if screenshot:
-        screen_width, screen_height = screenshot.size
-
-        final_left = max(0, min_left - padding)
-        final_right = min(screen_width, stable_right_edge + padding)
-        final_top = max(0, min_top - padding)
-        final_bottom = min(screen_height, max_bottom + padding)
-
-        print(f"[INFO] Buchbereich: ({final_left}, {final_top}, {final_right}, {final_bottom})")
-
-        print(f"[INFO] Navigiere {pages_navigated} Seiten zurueck...")
-        for i in range(pages_navigated):
-            click_prev_page()
-            time.sleep(0.5)
-
-        time.sleep(0.3)
-        return (final_left, final_top, final_right, final_bottom)
-
-    return None
-
-# ============================================================
 # Main Functions
 # ============================================================
 
@@ -1417,46 +543,79 @@ def clear_output_folder(folder):
             f.unlink()
         print(f"[OK] Ausgabeordner geleert")
 
+def _save_page(output_folder, page_num, image):
+    """Save one captured page image and wait until it is on disk."""
+    filename = f"page_{page_num:04d}.png"
+    filepath = output_folder / filename
+    image.save(filepath, "PNG")
+    while not filepath.exists():
+        check_stop_and_exit()
+        time.sleep(0.05)
+    print(f"[OK] Gespeichert: {filename}")
+
+
 def capture_pages(output_folder, book_region):
-    """Capture all pages from Kindle book."""
+    """Capture all pages: save the current page, PageDown, repeat until the book
+    no longer advances.
+
+    A page turn is verified by watching for the page image to change. Crucially,
+    on a 'no change' we do NOT turn again while waiting - a page that simply
+    renders slowly would otherwise be skipped. Only after the page fails to change
+    across RENDER_POLL_TRIES polls (and one re-focus click + retry) do we conclude
+    the end of the book has been reached."""
     global STOP_FLAG
 
-    page_num = 1
-    no_change_count = 0
-    last_page_image = None
+    def grab_page():
+        shot = grab_kindle_screenshot()
+        return shot.crop(book_region) if shot is not None else None
 
-    try:
-        while no_change_count < MAX_NO_CHANGE_COUNT:
+    def wait_for_new_page(reference):
+        """Poll (without turning the page) until the page differs from `reference`,
+        giving a slow render time to appear. Returns the new page image, or None if
+        it never changes (book did not advance)."""
+        for _ in range(RENDER_POLL_TRIES):
             check_stop_and_exit()
+            time.sleep(WAIT_AFTER_PAGE)
+            cur = grab_page()
+            if cur is not None and not images_are_similar(cur, reference):
+                return cur
+        return None
 
-            screenshot = grab_kindle_screenshot()
-            if screenshot is None:
-                print("[FEHLER] Kindle-Fenster verloren!")
-                break
+    page_num = 1
+    try:
+        # Save the first (current) page = cover
+        current = grab_page()
+        if current is None:
+            print("[FEHLER] Kindle-Fenster verloren!")
+            return 0
+        _save_page(output_folder, page_num, current)
+        page_num += 1
+        last_saved = current
 
-            book_page = screenshot.crop(book_region)
+        while True:
+            check_stop_and_exit()
+            press_next_page()
+            new_page = wait_for_new_page(last_saved)
 
-            if images_are_similar(book_page, last_page_image):
-                no_change_count += 1
-                print(f"[INFO] Keine Aenderung erkannt ({no_change_count}/{MAX_NO_CHANGE_COUNT})")
-            else:
-                no_change_count = 0
+            if new_page is None:
+                # No advance: might be end of book, or the reader lost keyboard
+                # focus (e.g. foreground was stolen). Re-activate and re-focus the
+                # reader with a click, wait for the click's chrome to fade again,
+                # then give it one more chance before concluding "end".
+                print("[INFO] Keine Aenderung - pruefe Buchende / Fokus...")
+                find_and_activate_kindle()
+                _click_reader_center()
+                park_mouse_center()
+                wait_until_screen_stable(max_wait=6)
+                press_next_page()
+                new_page = wait_for_new_page(last_saved)
+                if new_page is None:
+                    print("[OK] Buchende erreicht.")
+                    break
 
-                filename = f"page_{page_num:04d}.png"
-                filepath = output_folder / filename
-                book_page.save(filepath, "PNG")
-
-                while not filepath.exists():
-                    check_stop_and_exit()
-                    time.sleep(0.05)
-
-                print(f"[OK] Gespeichert: {filename}")
-
-                last_page_image = book_page.copy()
-                page_num += 1
-
-            click_next_page()
-            time.sleep(WAIT_AFTER_CLICK)
+            _save_page(output_folder, page_num, new_page)
+            page_num += 1
+            last_saved = new_page
 
     except KeyboardInterrupt:
         print("\n[INFO] Erfassung vom Benutzer gestoppt.")
@@ -1464,6 +623,22 @@ def capture_pages(output_folder, book_region):
         raise
 
     return page_num - 1
+
+def keep_session_awake(enable=True):
+    """Prevent the display from sleeping / the screensaver-lock from kicking in
+    during a long capture run. Synthetic pyautogui input does NOT reset Windows'
+    idle timer, so without this a multi-minute capture can end up on the lock
+    screen - where keyboard input no longer reaches Kindle and paging dies."""
+    import ctypes
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    if enable:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+    else:
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
 
 def main():
     """Main function - capture book pages."""
@@ -1485,7 +660,11 @@ def main():
     print(f"[INFO] Ausgabeordner: {output_folder}")
     print()
 
-    # Prepare Kindle: find window, goto title page, enter fullscreen, detect book region
+    # Keep the session awake for the whole (multi-minute) run so a screensaver /
+    # display timeout can't lock the desktop mid-capture (which would kill paging).
+    keep_session_awake(True)
+
+    # Prepare Kindle: find window, click-focus + F11 fullscreen, go to cover
     # NOTE: keyboard listener starts AFTER preparation to avoid accidental stops
     book_region = prepare_kindle_for_capture()
     if book_region is None:
@@ -1511,6 +690,7 @@ def main():
         pass
     finally:
         stop_keyboard_listener()
+        keep_session_awake(False)
 
     # Exit fullscreen and minimize Kindle
     exit_fullscreen_and_minimize()
