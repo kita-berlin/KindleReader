@@ -27,7 +27,8 @@ Usage:
    - Click once to focus the reader, then F11 -> clean fullscreen
    - Navigate to the very beginning / cover (PageUp until the page stops changing)
    - Detect the page format from the title page (the letterboxed cover stands out
-     from the uniform black/white margin via per-column/row pixel variance)
+     from the uniform black/white margin; found via content coverage per column
+     plus a margin test that keeps window chrome out - see the function)
    - Capture every page CROPPED to that title-page format (PrintWindow), paging
      forward with PageDown - so all pages have the same format as the cover
 
@@ -494,41 +495,80 @@ def grab_kindle_screenshot(retries=4, delay=0.2):
 # Image Analysis
 # ============================================================
 
+# Cover detection tuning
+BG_TOL = 10          # Per-channel difference from the letterbox colour that counts as page content
+MIN_COVERAGE = 0.5   # Fraction of a column/row that must be content for it to belong to the page
+
+
+def _longest_run(flags):
+    """Start and end (exclusive) of the longest contiguous True run in flags.
+    The page is ONE solid block, so taking the longest run ignores stray
+    single-pixel hits (e.g. the 1px window border column)."""
+    best_len = best_start = 0
+    cur = None
+    for i, v in enumerate(flags):
+        if v and cur is None:
+            cur = i
+        elif not v and cur is not None:
+            if i - cur > best_len:
+                best_len, best_start = i - cur, cur
+            cur = None
+    if cur is not None and len(flags) - cur > best_len:
+        best_len, best_start = len(flags) - cur, cur
+    return best_start, best_start + best_len
+
+
 def detect_page_region_from_cover(cover_img):
     """Detect the book PAGE region (bounding box) from the cover / title page and
-    return (left, top, right, bottom). The cover is a portrait rectangle that
-    stands out from the uniform black (dark mode) or white (light mode) letterbox
-    around it. We find that rectangle via per-column / per-row variance: the cover
-    content has pixel variation, the uniform letterbox has ~zero variance. ALL pages
-    are then cropped to this region, so every captured page has the same format as
-    the title page - not the full (mostly empty) screen."""
-    gray = np.asarray(cover_img.convert('RGB')).astype(np.float32).mean(axis=2)
-    height, width = gray.shape
+    return (left, top, right, bottom). ALL pages are cropped to this region, so
+    every captured page has the same format as the title page - not the full
+    (mostly empty) screen.
 
-    # Per-column variance over the vertical middle (ignore the very top/bottom edges)
-    scan_top, scan_bottom = int(height * 0.02), int(height * 0.98)
-    col_var = np.array([np.var(gray[scan_top:scan_bottom, max(0, c - 2):min(width, c + 3)])
-                        for c in range(width)])
-    col_thr = col_var.max() * 0.05
-    left = next((c for c in range(width // 2) if col_var[c] > col_thr), 0)
-    right = next((c for c in range(width - 1, width // 2, -1) if col_var[c] > col_thr), width - 1) + 1
+    The cover is a portrait rectangle sitting in a uniform black (dark mode) or
+    white (light mode) letterbox. We do NOT use pixel variance: window chrome (the
+    Kindle title bar) has variance too, so a variance scan latches onto the chrome
+    and returns the whole window (measured: 1443x834 landscape instead of the
+    516x804 cover). Instead we use COVERAGE plus a margin test:
 
-    # Per-row variance over the detected column band
-    row_var = np.array([np.var(gray[max(0, r - 2):min(height, r + 3), left:right])
-                        for r in range(height)])
-    row_thr = row_var.max() * 0.05
-    top = next((r for r in range(height // 2) if row_var[r] > row_thr), 0)
-    bottom = next((r for r in range(height - 1, height // 2, -1) if row_var[r] > row_thr), height - 1) + 1
+      columns - a column through the page is content over most of its height,
+                while the title bar covers only a few percent of it, so a coverage
+                threshold drops the chrome. Longest contiguous run = the page.
+      rows    - the title bar is content across the FULL width, so coverage alone
+                would take it for page. But a real page row has BACKGROUND in the
+                side margins next to the page, whereas a chrome row does not.
+                That margin test is what separates page from chrome."""
+    a = np.asarray(cover_img.convert('RGB')).astype(np.int16)
+    height, width, _ = a.shape
+
+    # Letterbox colour: the far-left/far-right edge strips over the vertical middle
+    # are always uniform margin, because the page is centred horizontally.
+    band = a[int(height * 0.25):int(height * 0.75)]
+    bg = np.median(np.concatenate([band[:, :10], band[:, -10:]], axis=1).reshape(-1, 3), axis=0)
+    mask = np.abs(a - bg).max(axis=2) > BG_TOL  # True = page content, False = letterbox
+
+    left, right = _longest_run(mask.mean(axis=0) > MIN_COVERAGE)
+
+    inside = mask[:, left:right].mean(axis=1) > MIN_COVERAGE
+    margin = np.concatenate([mask[:, :left], mask[:, right:]], axis=1)
+    # No margin at all (page spans the full width) -> the margin test cannot apply.
+    outside_clear = (margin.mean(axis=1) < MIN_COVERAGE) if margin.size else np.ones(height, bool)
+    top, bottom = _longest_run(inside & outside_clear)
 
     pw, ph = right - left, bottom - top
-    print(f"  Titelseiten-Format: ({left},{top})-({right},{bottom}) = {pw} x {ph} Pixel")
+    ratio = f" (Seitenverhaeltnis {pw / ph:.3f})" if ph else ""
+    print(f"  Titelseiten-Format: ({left},{top})-({right},{bottom}) = {pw} x {ph} Pixel{ratio}")
 
-    # Sanity: a real page must be a reasonable chunk of the screen
-    if pw > width * 0.15 and ph > height * 0.30:
-        return (left, top, right, bottom)
+    # Fail loud: no letterbox found means we are not looking at a letterboxed title
+    # page (wrong page, or chrome swallowed everything) - cropping would be wrong.
+    if pw >= width * 0.98 and ph >= height * 0.98:
+        print("[FEHLER] Kein Seitenrand gefunden - das ist keine letterboxte Titelseite!")
+        print("[FEHLER] Steht Kindle auf der Titelseite und ist Layout 'Einzelne Spalte' gesetzt?")
+        sys.exit(1)
+    if pw < width * 0.15 or ph < height * 0.30:
+        print(f"[FEHLER] Titelseiten-Format nicht erkennbar ({pw}x{ph} zu klein)!")
+        sys.exit(1)
 
-    print(f"[FEHLER] Titelseiten-Format nicht erkennbar ({pw}x{ph} zu klein)!")
-    sys.exit(1)
+    return (left, top, right, bottom)
 
 
 def images_are_similar(img1, img2, change_threshold=0.006, pixel_diff=24):
@@ -591,9 +631,29 @@ def capture_pages(output_folder, book_region):
     the end of the book has been reached."""
     global STOP_FLAG
 
+    # Window size the crop region was measured on. book_region is fixed for the
+    # whole run, so if the window is resized (or drops out of fullscreen) midway,
+    # every following crop would silently cut the wrong part of the page.
+    expected_size = None
+
     def grab_page():
+        nonlocal expected_size
         shot = grab_kindle_screenshot()
-        return shot.crop(book_region) if shot is not None else None
+        if shot is None:
+            return None
+        if expected_size is None:
+            expected_size = shot.size
+            if book_region[2] > shot.size[0] or book_region[3] > shot.size[1]:
+                print(f"[FEHLER] Titelseiten-Format {book_region} passt nicht ins "
+                      f"Fenster {shot.size}!")
+                sys.exit(1)
+        elif shot.size != expected_size:
+            print(f"[FEHLER] Fenstergroesse hat sich waehrend der Erfassung geaendert: "
+                  f"{expected_size} -> {shot.size}")
+            print("[FEHLER] Der Zuschnitt auf das Titelseiten-Format waere ab hier falsch.")
+            print("[FEHLER] Kindle-Fenster waehrend des Laufs NICHT veraendern!")
+            sys.exit(1)
+        return shot.crop(book_region)
 
     def wait_for_new_page(reference):
         """Poll (without turning the page) until the page differs from `reference`,
