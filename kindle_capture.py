@@ -24,7 +24,12 @@ Usage:
 3. Run: kindle_capture.exe
 4. The script will automatically:
    - Find and activate the Kindle window
-   - Click once to focus the reader, then F11 -> clean fullscreen
+   - Click once to focus the reader, then F11 -> clean fullscreen (fullscreen and
+     mouse parking are computed against the monitor the KINDLE WINDOW is on, so
+     multi-monitor setups work)
+   - PROVE the page keys reach the reader (a PageDown or PageUp must visibly turn
+     the page; if neither does, fail loud with a _debug_fokus.png evidence shot
+     instead of misreading 'no change' as 'cover reached')
    - Navigate to the very beginning / cover (PageUp until the page stops changing)
    - Detect the page format from the title page (the letterboxed cover stands out
      from the uniform black/white margin; found via content coverage per column
@@ -53,6 +58,8 @@ from pynput import keyboard
 try:
     import win32gui
     import win32ui
+    import win32api
+    import win32con
 except ImportError as e:
     print("[FEHLER] PYWIN32 NICHT INSTALLIERT!")
     print("[FEHLER] BEFEHL: pip install pywin32")
@@ -202,21 +209,38 @@ def exit_fullscreen_and_minimize():
 # appears. We do NOT use Ctrl+G to jump to a page: its dialog steals the reader's
 # focus, which then kills the page keys. All verified live 2026-07-19.
 
+def _monitor_size_of(hwnd):
+    """Width/height of the monitor the window is on. Multi-monitor safe: with two
+    monitors, pyautogui.size() reports only the PRIMARY monitor - comparing a
+    Kindle window on the second monitor against that gives wrong fullscreen
+    verdicts (seen in the field: Kindle at (-2560,0) was never 'fullscreen')."""
+    mon = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+    left, top, right, bottom = win32api.GetMonitorInfo(mon)['Monitor']
+    return right - left, bottom - top
+
+
 def park_mouse_center():
-    """Move (NOT click) the mouse to a neutral spot in the middle of the reading
-    area, away from the side arrows / top toolbar / bottom slider, so no
-    hover-chrome appears. Moving the mouse does not steal keyboard focus."""
-    screen_width, screen_height = pyautogui.size()
-    pyautogui.moveTo(screen_width // 2, int(screen_height * 0.5), duration=0.1)
+    """Move (NOT click) the mouse to a neutral spot in the middle of the KINDLE
+    WINDOW's reading area, away from the side arrows / top toolbar / bottom
+    slider, so no hover-chrome appears. Window-relative, NOT primary-screen
+    center: with two monitors the primary center can lie on a different monitor
+    over some other app entirely. Moving the mouse does not steal keyboard
+    focus."""
+    kindle = get_kindle_window()
+    if not kindle:
+        return
+    pyautogui.moveTo(kindle.left + kindle.width // 2,
+                     kindle.top + kindle.height // 2, duration=0.1)
 
 
 def _is_fullscreen():
-    """True if the Kindle window currently covers (almost) the whole screen."""
+    """True if the Kindle window currently covers (almost) the whole monitor IT
+    IS ON (not the primary monitor - see _monitor_size_of)."""
     kindle = get_kindle_window()
     if not kindle:
         return False
-    screen_width, screen_height = pyautogui.size()
-    return kindle.width >= screen_width * 0.98 and kindle.height >= screen_height * 0.98
+    mon_width, mon_height = _monitor_size_of(kindle._hWnd)
+    return kindle.width >= mon_width * 0.98 and kindle.height >= mon_height * 0.98
 
 
 def _click_reader_margin():
@@ -315,6 +339,38 @@ def go_to_book_start():
     extra presses are cheap."""
     print("[INFO] Navigiere zum Buchanfang (Cover) per PageUp...")
     park_mouse_center()
+
+    # PROOF that page keys reach the reader. Without this, "PageUp changes
+    # nothing" is ambiguous: already at the cover - OR the reader has no keyboard
+    # focus / PrintWindow returns stale frames. Seen in the field: 3x PageUp with
+    # zero effect was reported as '[OK] Cover erreicht' while Kindle sat
+    # untouched on page 3. A page turn in SOME direction must provably work
+    # before "no change" may be read as "cover reached".
+    print("[INFO] Pruefe Seitentasten-Reaktion (Tastaturfokus)...")
+    before = grab_kindle_screenshot()
+    pyautogui.press('pagedown')
+    time.sleep(WAIT_AFTER_PAGE)
+    after = grab_kindle_screenshot()
+    if before is not None and after is not None and not images_are_similar(after, before):
+        print("  [OK] Seitentasten wirken (PageDown hat geblaettert)")
+        pyautogui.press('pageup')  # go back to where we started
+        time.sleep(WAIT_AFTER_PAGE)
+    else:
+        # PageDown did nothing - legitimate only at the very last page. PageUp
+        # must then work; if NEITHER key changes the page, fail loud.
+        pyautogui.press('pageup')
+        time.sleep(WAIT_AFTER_PAGE)
+        after2 = grab_kindle_screenshot()
+        if before is None or after2 is None or images_are_similar(after2, before):
+            debug_path = Path.cwd() / "_debug_fokus.png"
+            if after2 is not None:
+                after2.save(debug_path)
+            print("[FEHLER] Reader reagiert weder auf PageDown noch auf PageUp!")
+            print("[FEHLER] Ursache: kein Tastaturfokus im Reader ODER PrintWindow liefert")
+            print("[FEHLER] eingefrorene Frames. Kindle-Fenster manuell anklicken und neu starten.")
+            print(f"[FEHLER] Beweis-Screenshot: {debug_path}")
+            sys.exit(1)
+        print("  [OK] Seitentasten wirken (PageUp hat geblaettert - Buch stand am Ende)")
 
     last = grab_kindle_screenshot()
     no_change = 0
@@ -435,7 +491,15 @@ def prepare_kindle_for_capture():
         print("[FEHLER] Konnte Screenshot nicht erstellen!")
         sys.exit(1)
 
-    book_region = detect_page_region_from_cover(screenshot)  # Bricht bei Fehler ab
+    book_region = detect_page_region_from_cover(screenshot)
+    if book_region is None:
+        # Fail loud WITH evidence: save the grab the detection ran on, so a
+        # failing setup (other machine, other monitor, stale rendering) can be
+        # diagnosed from the file instead of guessed at.
+        debug_path = Path.cwd() / "_debug_titelseite.png"
+        screenshot.save(debug_path)
+        print(f"[FEHLER] Beweis-Screenshot der fehlgeschlagenen Erkennung: {debug_path}")
+        sys.exit(1)
     left, top, right, bottom = book_region
     print(f"[OK] Seitenformat (von Titelseite): {right - left} x {bottom - top} Pixel")
 
@@ -558,15 +622,17 @@ def detect_page_region_from_cover(cover_img):
     ratio = f" (Seitenverhaeltnis {pw / ph:.3f})" if ph else ""
     print(f"  Titelseiten-Format: ({left},{top})-({right},{bottom}) = {pw} x {ph} Pixel{ratio}")
 
-    # Fail loud: no letterbox found means we are not looking at a letterboxed title
-    # page (wrong page, or chrome swallowed everything) - cropping would be wrong.
+    # No letterbox found means we are not looking at a letterboxed title page
+    # (wrong page, or chrome swallowed everything) - cropping would be wrong.
+    # Return None; the caller fails loud WITH the offending screenshot as
+    # evidence (we cannot save it here - only the caller knows the book folder).
     if pw >= width * 0.98 and ph >= height * 0.98:
         print("[FEHLER] Kein Seitenrand gefunden - das ist keine letterboxte Titelseite!")
         print("[FEHLER] Steht Kindle auf der Titelseite und ist Layout 'Einzelne Spalte' gesetzt?")
-        sys.exit(1)
+        return None
     if pw < width * 0.15 or ph < height * 0.30:
         print(f"[FEHLER] Titelseiten-Format nicht erkennbar ({pw}x{ph} zu klein)!")
-        sys.exit(1)
+        return None
 
     return (left, top, right, bottom)
 
