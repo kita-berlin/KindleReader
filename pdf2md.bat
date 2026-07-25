@@ -35,8 +35,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM pwsh (PowerShell 7) statt Windows-PowerShell 5.1: dessen Tee-Object schreibt
+REM das Log als UTF-16 und macht es fuer grep & Co. unbrauchbar; pwsh schreibt UTF-8.
+where pwsh >nul 2>&1
+if errorlevel 1 (
+    echo [FEHLER] pwsh ^(PowerShell 7^) nicht gefunden - wird fuer UTF-8-Log gebraucht!
+    pause
+    exit /b 1
+)
+
 title pdf2md %~1
-powershell -NoProfile -Command "& python -u '%BOOKREADER%batch_pdf2md.py' '%~1' 2>&1 | Tee-Object -FilePath '%~1\pdf2md.log'"
+pwsh -NoProfile -Command "& python -u '%BOOKREADER%batch_pdf2md.py' '%~1' 2>&1 | Tee-Object -FilePath '%~1\pdf2md.log'"
 echo.
 echo [INFO] Fertig. Log: %~1\pdf2md.log
 pause
