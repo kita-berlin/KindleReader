@@ -6,3 +6,4 @@ pynput
 pywin32
 winsdk
 reportlab
+PyMuPDF

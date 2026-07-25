@@ -40,6 +40,7 @@ import sys
 import asyncio
 import io
 import json
+import os
 import subprocess
 import tempfile
 import shutil
@@ -80,11 +81,18 @@ except ImportError:
 # ============================================================
 
 def check_ocr_languages():
-    """Check available OCR languages and return the best engine."""
+    """Check available OCR languages and return the best engine.
+
+    The preference order defaults to German-first. It can be overridden with the
+    KINDLE_OCR_LANG environment variable (comma-separated language tags, e.g.
+    "en-US,en") - batch_pdf2md.py uses that to OCR English books with the
+    English engine. The variable is inherited by the per-page OCR subprocesses."""
     if not WINDOWS_OCR_AVAILABLE:
         return None, "winsdk nicht installiert"
 
-    for lang_tag in ['de-DE', 'de', 'en-US', 'en']:
+    pref = os.environ.get('KINDLE_OCR_LANG')
+    tags = [t.strip() for t in pref.split(',') if t.strip()] if pref else ['de-DE', 'de', 'en-US', 'en']
+    for lang_tag in tags:
         try:
             lang = Language(lang_tag)
             if OcrEngine.is_language_supported(lang):
@@ -224,19 +232,25 @@ def extract_pdf_pages(pdf_path, temp_dir, dpi=PDF_DPI):
 # ============================================================
 
 def analyze_page(img_path, ocr_lines):
-    """Analyze whether a page is text-heavy, image-heavy, or mixed.
+    """Analyze whether a page image FILE is text-heavy, image-heavy, or mixed.
+    Thin wrapper around analyze_page_array - see there for the method."""
+    return analyze_page_array(np.array(Image.open(img_path)), ocr_lines)
 
-    Uses OCR text regions to mask known text areas. Remaining non-text,
-    non-empty areas that span at least 2x text line height are graphics.
+
+def analyze_page_array(img_array, ocr_lines):
+    """Analyze whether a page (as a numpy image array) is text-heavy,
+    image-heavy, or mixed.
+
+    Uses the text line regions (from OCR or a PDF text layer - anything with
+    'text', 'y', 'height' entries in image coordinates) to mask known text
+    areas. Remaining non-text, non-empty areas that span at least 2x text line
+    height are graphics.
 
     Returns:
         'text'  - mostly text, no need to save image
         'image' - mostly image/chart/diagram, save image
         'mixed' - has both significant text and images
     """
-    img = Image.open(img_path)
-    img_array = np.array(img)
-
     if len(img_array.shape) == 3:
         gray = np.mean(img_array[:, :, :3], axis=2)
     else:

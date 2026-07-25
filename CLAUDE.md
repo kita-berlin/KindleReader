@@ -47,6 +47,30 @@ Die `scan.bat` führt folgende Schritte aus:
 
 Bereits vorhandene Outputs werden automatisch übersprungen.
 
+## Batch: vorhandene PDFs → Markdown (ohne Kindle)
+
+`pdf2md.bat <Wurzelordner>` (Treiber: `batch_pdf2md.py`) konvertiert rekursiv **alle**
+`*.pdf` unter dem Wurzelordner in Markdown — gleiche Methode/gleiches Format wie
+`create_markdown.py`, nur ohne den Kindle-Erfassungsschritt:
+
+- **TEXT-Bücher** (PDF hat Text-Layer): Text wird pro Seite direkt extrahiert (exakt, kein
+  OCR). Seiten-Klassifikation (Text/Bild/Gemischt) über **dieselbe Pixel-Analyse** wie die
+  bestehende Methode (`analyze_page_array`, gefüttert mit den Text-Layer-Zeilenboxen)
+  **vereinigt** mit einem Raster-Bild-Abdeckungs-Signal (dünne helle Chart-Linien auf weißen
+  Seiten liegen unter den Pixel-Schwellen, eingebettete Raster-Charts sieht die Bildliste
+  direkt). Headings über Fontgröße (gleicher 1.4×-Faktor wie `detect_headings`).
+- **SCAN-Bücher** (reines Bild-PDF): Seiten werden gerendert und durch die **bestehende
+  OCR-Strecke** aus `create_markdown.py` geschickt (Subprozess-Isolation, `analyze_page`,
+  `detect_headings`, `save_page_image`). OCR-Sprache wird **pro Buch automatisch erkannt**
+  (Probeseiten mit de/en-Engine, Stoppwort-Score) und via Env-Variable `KINDLE_OCR_LANG`
+  an die OCR-Subprozesse vererbt (`check_ocr_languages` liest sie; Default bleibt de zuerst).
+- **Duplikate** (gleiche MD5) werden einmal konvertiert, weitere Fundorte bekommen eine
+  Kopie des fertigen markdown-Ordners. Vorhandene nicht-leere .md werden übersprungen
+  (abgebrochener Lauf einfach neu starten). Fehler werden pro Buch laut gemeldet und am
+  Ende zusammengefasst (Exit-Code ≠ 0). Quell-PDFs werden nie verändert.
+- Ausgabe je Buch: `<pdf_ordner>\markdown\<pdfname>\<pdfname>.md` + `page_NNNN.jpg`.
+- Log per tee nach `<Wurzelordner>\pdf2md.log`; Konsolen-Titel zeigt laufend `[k/N] Buch`.
+
 ---
 
 ## Voraussetzungen (WICHTIG — vor dem Start prüfen!)
