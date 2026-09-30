@@ -31,11 +31,14 @@ Usage:
      the page; if neither does, fail loud with a _debug_fokus.png evidence shot
      instead of misreading 'no change' as 'cover reached')
    - Navigate to the very beginning / cover (PageUp until the page stops changing)
-   - Detect the page format from the title page (the letterboxed cover stands out
-     from the uniform black/white margin; found via content coverage per column
-     plus a margin test that keeps window chrome out - see the function)
+   - Detect the page format from the title page: the page is what lies between the
+     uniform black/white letterbox bars left and right, over the full window height
+     (only left/right are searched; letterbox-coloured print ON the page does not
+     split it - see the function)
    - Capture every page CROPPED to that title-page format (PrintWindow), paging
      forward with PageDown - so all pages have the same format as the cover
+   - End of book = the content no longer changes when paging forward, decided by an
+     exact pixel comparison without any threshold
 
 Author: Claude
 """
@@ -298,34 +301,61 @@ def enter_fullscreen():
     sys.exit(1)
 
 
-def wait_until_screen_stable(max_wait=8, interval=0.5, stable_needed=2, threshold=1.0):
-    """Wait until the screen stops changing (fullscreen transition + the transient
-    'Drücke F11 zum Beenden' hint fading). Replaces the old OCR-based hint wait
-    with a UI-independent screenshot-difference check."""
-    print("[INFO] Warte bis Bildschirm stabil...")
+STILL_SAMPLES = 4      # consecutive pixel-identical grabs that count as "the screen is still"
+STILL_TIMEOUT_S = 20   # max wait for the screen to come to rest before failing loud
+
+_still_frames_verified = False
+
+
+def wait_until_still(label):
+    """Wait until STILL_SAMPLES consecutive grabs are PIXEL-IDENTICAL: the screen has
+    come to rest (fullscreen transition, 'F11' hint, click chrome all done). No
+    threshold - a single differing pixel restarts the count.
+
+    Replaces the former mean-difference check ('stable' = mean |diff| <= 1.0), which
+    let a late change through: measured 29.09.2026, right after it reported 'stable',
+    4 grabs of the still page differed by [0, 0, 22073] px.
+
+    It is also the precondition of the exact page comparison (images_are_similar):
+    if the screen never comes to rest within STILL_TIMEOUT_S, 'the content no longer
+    changes' could never be decided -> fail loud, saving the last differing pair as
+    _debug_unruhe_1.png / _debug_unruhe_2.png."""
+    global _still_frames_verified
+    print(f"[INFO] Warte auf Stillstand ({label})...")
     prev = grab_kindle_screenshot()
-    stable = 0
-    waited = 0.0
-    while waited < max_wait:
+    if prev is None:
+        print("[FEHLER] Konnte Screenshot fuer die Stillstands-Pruefung nicht erstellen!")
+        sys.exit(1)
+    counts = []
+    identical = 1
+    last_pair = None
+    start = time.time()
+    while identical < STILL_SAMPLES:
         check_stop_and_exit()
-        time.sleep(interval)
-        waited += interval
+        if time.time() - start > STILL_TIMEOUT_S:
+            print(f"[FEHLER] Bildschirm kommt nicht zur Ruhe ({STILL_TIMEOUT_S}s). "
+                  f"Pixel-Unterschiede: {counts}")
+            print("[FEHLER] 'Inhalt aendert sich nicht mehr' waere so nie feststellbar.")
+            if last_pair is not None:
+                last_pair[0].save(Path.cwd() / "_debug_unruhe_1.png")
+                last_pair[1].save(Path.cwd() / "_debug_unruhe_2.png")
+                print("[FEHLER] Beweisbilder: _debug_unruhe_1.png, _debug_unruhe_2.png")
+            sys.exit(1)
+        time.sleep(WAIT_AFTER_PAGE)
         cur = grab_kindle_screenshot()
-        if prev is not None and cur is not None and prev.size == cur.size:
-            a = np.asarray(prev, dtype=np.float32)
-            b = np.asarray(cur, dtype=np.float32)
-            d = float(np.mean(np.abs(a - b)))
+        if cur is None:
+            print("[FEHLER] Konnte Screenshot fuer die Stillstands-Pruefung nicht erstellen!")
+            sys.exit(1)
+        n = changed_pixels(prev, cur) if prev.size == cur.size else f"Groesse {prev.size}->{cur.size}"
+        counts.append(n)
+        if n == 0:
+            identical += 1
         else:
-            d = 999.0
+            identical = 1
+            last_pair = (prev, cur)
         prev = cur
-        if d <= threshold:
-            stable += 1
-            if stable >= stable_needed:
-                print(f"[OK] Bildschirm stabil nach {waited:.1f}s")
-                return
-        else:
-            stable = 0
-    print("[WARNUNG] Timeout beim Warten auf stabilen Bildschirm - fahre fort")
+    print(f"[OK] Stillstand nach {time.time() - start:.1f}s (Pixel-Unterschiede: {counts})")
+    _still_frames_verified = True
 
 
 def go_to_book_start():
@@ -476,12 +506,14 @@ def prepare_kindle_for_capture():
     print()
     print("[SCHRITT 2/4] Vollbildmodus aktivieren (F11)...")
     enter_fullscreen()  # Bricht bei Fehler mit sys.exit(1) ab
-    wait_until_screen_stable()
+    # Every page-change decision (go_to_book_start, capture) is an exact pixel
+    # comparison; this also proves that still frames are pixel-identical.
+    wait_until_still("nach F11")
 
     print()
     print("[SCHRITT 3/4] Zum Buchanfang (Cover) navigieren...")
     go_to_book_start()
-    wait_until_screen_stable(max_wait=4)
+    wait_until_still("Titelseite")
 
     # We are on the title page now -> derive the page crop region from it.
     print()
@@ -502,6 +534,14 @@ def prepare_kindle_for_capture():
         sys.exit(1)
     left, top, right, bottom = book_region
     print(f"[OK] Seitenformat (von Titelseite): {right - left} x {bottom - top} Pixel")
+    # Always keep the UNCROPPED title-page grab as evidence: the crop region is
+    # derived from it, so a wrong crop can be re-checked offline. Measured 29.09.2026
+    # (Cybernetic Analysis ...): region (554,157)-(1364,1080), yet text pages had ink
+    # in the crop's first pixel row and page 7 (text at the top only) came out pure
+    # white - without this file the fullscreen geometry could not be inspected.
+    evidence = Path.cwd() / "_debug_titelseite_voll.png"
+    screenshot.save(evidence)
+    print(f"[INFO] Titelseite ungeschnitten gespeichert: {evidence}")
 
     print()
     print("[OK] Kindle bereit fuer Erfassung!")
@@ -560,26 +600,45 @@ def grab_kindle_screenshot(retries=4, delay=0.2):
 # ============================================================
 
 # Cover detection tuning
-BG_TOL = 10          # Per-channel difference from the letterbox colour that counts as page content
-MIN_COVERAGE = 0.5   # Fraction of a column/row that must be content for it to belong to the page
+BG_TOL = 10           # Per-channel difference from the letterbox colour that counts as page content
+MIN_COVERAGE = 0.5    # Content fraction: above it an edge-strip row is window chrome;
+                      # below it the page area is no letterboxed title page
+LETTERBOX_MAX = 0.02  # Content fraction up to which a column still counts as pure letterbox
+EDGE_STRIP = 10       # Width (px) of the far-left/far-right strips that define the letterbox colour
 
 
-def _longest_run(flags):
-    """Start and end (exclusive) of the longest contiguous True run in flags.
-    The page is ONE solid block, so taking the longest run ignores stray
-    single-pixel hits (e.g. the 1px window border column)."""
-    best_len = best_start = 0
-    cur = None
-    for i, v in enumerate(flags):
-        if v and cur is None:
-            cur = i
-        elif not v and cur is not None:
-            if i - cur > best_len:
-                best_len, best_start = i - cur, cur
-            cur = None
-    if cur is not None and len(flags) - cur > best_len:
-        best_len, best_start = len(flags) - cur, cur
-    return best_start, best_start + best_len
+def _page_span(is_letterbox):
+    """(start, end) of the page between the two letterbox bars along one axis.
+
+    Walks inward from each edge: past a stray non-letterbox strip AT the edge (the
+    1px window border), across the letterbox bar, up to the first index that is not
+    letterbox. Everything between those two stops is page - INCLUDING interior
+    stretches that look like letterbox (e.g. a black bar printed on the cover).
+    A side without a bar (no letterbox index in that half) -> the page reaches that
+    edge. Returns None if a bar runs to the middle (no page found)."""
+    n = len(is_letterbox)
+    half = n // 2
+    lb = np.flatnonzero(is_letterbox)
+
+    left_bar = lb[lb < half]
+    if left_bar.size == 0:
+        start = 0
+    else:
+        after = np.flatnonzero(~is_letterbox[left_bar[0]:half])
+        if after.size == 0:
+            return None
+        start = left_bar[0] + after[0]
+
+    right_bar = lb[lb >= half]
+    if right_bar.size == 0:
+        end = n
+    else:
+        before = np.flatnonzero(~is_letterbox[half:right_bar[-1] + 1])
+        if before.size == 0:
+            return None
+        end = half + before[-1] + 1
+
+    return start, end
 
 
 def detect_page_region_from_cover(cover_img):
@@ -588,79 +647,111 @@ def detect_page_region_from_cover(cover_img):
     every captured page has the same format as the title page - not the full
     (mostly empty) screen.
 
-    The cover is a portrait rectangle sitting in a uniform black (dark mode) or
-    white (light mode) letterbox. We do NOT use pixel variance: window chrome (the
-    Kindle title bar) has variance too, so a variance scan latches onto the chrome
-    and returns the whole window (measured: 1443x834 landscape instead of the
-    516x804 cover). Instead we use COVERAGE plus a margin test:
+    Definition: the page is what lies BETWEEN the uniform letterbox bars on the
+    left and right (black in dark mode, white in light mode). Only the LEFT and
+    RIGHT edge are searched; vertically the page is the full window height - in
+    Kindle's fullscreen the text runs from the very top to the very bottom of the
+    screen (user decision 29.09.2026). The page may itself contain the letterbox
+    colour - e.g. a black bar printed on a white title page - so nothing here
+    requires the page to be 'mostly different' from the letterbox.
 
-      columns - a column through the page is content over most of its height,
-                while the title bar covers only a few percent of it, so a coverage
-                threshold drops the chrome. Longest contiguous run = the page.
-      rows    - the title bar is content across the FULL width, so coverage alone
-                would take it for page. But a real page row has BACKGROUND in the
-                side margins next to the page, whereas a chrome row does not.
-                That margin test is what separates page from chrome."""
+    Measured 29.09.2026 (Cybernetic Analysis ..., fullscreen): the former
+    longest-run-of-coverage>50% approach returned top=157 instead of 0 - rows
+    141-156 (the black bar on the cover) had only 44% non-black pixels, split the
+    page in two runs and the longer one (157-1078) won; every text page then lost
+    its top lines, and page 7 (text only at the top) came out pure white.
+
+    Steps:
+      reference rows - rows whose far-left/far-right edge strips are letterbox.
+                A title bar spans the full width, so its rows drop out here; that
+                keeps chrome from making letterbox columns look like content.
+      columns - over the reference rows a letterbox column is (almost) pure
+                letterbox colour; _page_span walks from both edges to the page
+                (past a stray 1px edge column - measured: x=1919 white on the
+                1920x1080 fullscreen title page).
+    We do NOT use pixel variance: window chrome has variance too, so a variance scan
+    returned the whole window (measured: 1443x834 landscape instead of the 516x804
+    cover)."""
     a = np.asarray(cover_img.convert('RGB')).astype(np.int16)
     height, width, _ = a.shape
 
     # Letterbox colour: the far-left/far-right edge strips over the vertical middle
     # are always uniform margin, because the page is centred horizontally.
     band = a[int(height * 0.25):int(height * 0.75)]
-    bg = np.median(np.concatenate([band[:, :10], band[:, -10:]], axis=1).reshape(-1, 3), axis=0)
-    mask = np.abs(a - bg).max(axis=2) > BG_TOL  # True = page content, False = letterbox
+    bg = np.median(np.concatenate([band[:, :EDGE_STRIP], band[:, -EDGE_STRIP:]], axis=1).reshape(-1, 3), axis=0)
+    mask = np.abs(a - bg).max(axis=2) > BG_TOL  # True = differs from letterbox colour
 
-    left, right = _longest_run(mask.mean(axis=0) > MIN_COVERAGE)
+    edges = np.concatenate([mask[:, :EDGE_STRIP], mask[:, -EDGE_STRIP:]], axis=1)
+    ref_rows = edges.mean(axis=1) < MIN_COVERAGE
+    if not ref_rows.any():
+        print("[FEHLER] Kein Seitenrand gefunden - die Fensterraender sind in keiner Zeile einfarbig!")
+        return None
 
-    inside = mask[:, left:right].mean(axis=1) > MIN_COVERAGE
-    margin = np.concatenate([mask[:, :left], mask[:, right:]], axis=1)
-    # No margin at all (page spans the full width) -> the margin test cannot apply.
-    outside_clear = (margin.mean(axis=1) < MIN_COVERAGE) if margin.size else np.ones(height, bool)
-    top, bottom = _longest_run(inside & outside_clear)
+    span = _page_span(mask[ref_rows].mean(axis=0) <= LETTERBOX_MAX)
+    if span is None:
+        print("[FEHLER] Keine Seite zwischen den Randbalken gefunden!")
+        return None
+    left, right = span
+    top, bottom = 0, height  # only left/right are searched (see docstring)
 
     pw, ph = right - left, bottom - top
-    ratio = f" (Seitenverhaeltnis {pw / ph:.3f})" if ph else ""
-    print(f"  Titelseiten-Format: ({left},{top})-({right},{bottom}) = {pw} x {ph} Pixel{ratio}")
+    print(f"  Titelseiten-Format: ({left},{top})-({right},{bottom}) = {pw} x {ph} Pixel "
+          f"(Seitenverhaeltnis {pw / ph:.3f})")
 
     # No letterbox found means we are not looking at a letterboxed title page
     # (wrong page, or chrome swallowed everything) - cropping would be wrong.
     # Return None; the caller fails loud WITH the offending screenshot as
     # evidence (we cannot save it here - only the caller knows the book folder).
-    if pw >= width * 0.98 and ph >= height * 0.98:
+    if pw >= width * 0.98:
         print("[FEHLER] Kein Seitenrand gefunden - das ist keine letterboxte Titelseite!")
         print("[FEHLER] Steht Kindle auf der Titelseite und ist Layout 'Einzelne Spalte' gesetzt?")
         return None
-    if pw < width * 0.15 or ph < height * 0.30:
-        print(f"[FEHLER] Titelseiten-Format nicht erkennbar ({pw}x{ph} zu klein)!")
+    if pw < width * 0.15:
+        print(f"[FEHLER] Titelseiten-Format nicht erkennbar ({pw}x{ph} zu schmal)!")
+        return None
+    # Plausibility check only (it never moves the edges): a letterboxed title page
+    # differs from the letterbox colour over most of its area, a plain text page on a
+    # letterbox-coloured background does not - then left/right would just be the
+    # text block. Measured 29.09.2026: title page 97.5% of its area, text pages
+    # 7 and 8 (white, a few lines of text) 1.0% within their ink columns.
+    area = float(mask[:, left:right].mean())
+    if area < MIN_COVERAGE:
+        print(f"[FEHLER] Keine Titelseite: nur {area:.1%} der Flaeche zwischen den Raendern "
+              f"weichen von der Randfarbe ab (Titelseite: >{MIN_COVERAGE:.0%})!")
         return None
 
     return (left, top, right, bottom)
 
 
-def images_are_similar(img1, img2, change_threshold=0.006, pixel_diff=24):
-    """True if the two page images are essentially identical (i.e. the page did NOT
-    turn). Compares the FRACTION of pixels that changed noticeably - NOT the mean
-    difference. With a single-column page the content is a small region on a large,
-    identical (black) background, so a mean-difference metric is dominated by that
-    background and wrongly reports 'no change' for two clearly different sparse pages.
-    Counting changed pixels is robust: measured on real pages a page turn changes
-    ~5-37% of pixels, while an unchanged page changes 0%. So anything below ~0.6% is
-    treated as 'no turn'."""
+# Page-change detection - NO threshold (user order 29.09.2026): the content "did not
+# change" only if the two grabs are PIXEL-IDENTICAL; any difference is a change.
+# End of book = the content no longer changes when paging forward; nothing else.
+# The former 'changed < 0.6% = no turn' missed a real turn - measured 29.09.2026,
+# pages 7->8 (two short front-matter pages) changed 3095 px = 0.354% of the 810x1080
+# crop (0.15% of the full frame), were taken for 'no turn', and the capture ended
+# after 7 of 326 pages.
+
+
+def changed_pixels(img1, img2):
+    """Number of pixels that differ at all between the two images."""
+    a = np.asarray(img1)
+    b = np.asarray(img2)
+    diff = (a != b).any(axis=2) if a.ndim == 3 else (a != b)
+    return int(np.count_nonzero(diff))
+
+
+def images_are_similar(img1, img2):
+    """True if the content did NOT change: the two images are pixel-identical.
+    Any difference - however small - counts as a change (no threshold). Requires a
+    prior wait_until_still(), which proves that still frames are identical."""
+    if not _still_frames_verified:
+        print("[FEHLER] Interner Fehler: Stillstands-Pruefung wurde nicht ausgefuehrt!")
+        sys.exit(1)
     if img1 is None or img2 is None:
         return False
-
     if img1.size != img2.size:
         return False
-
-    a = np.asarray(img1).astype(np.int16)
-    b = np.asarray(img2).astype(np.int16)
-    if a.ndim == 3:
-        diff = np.abs(a - b).max(axis=2)
-    else:
-        diff = np.abs(a - b)
-
-    changed_fraction = float(np.mean(diff > pixel_diff))
-    return changed_fraction < change_threshold
+    return changed_pixels(img1, img2) == 0
 
 # ============================================================
 # Main Functions
@@ -701,12 +792,16 @@ def capture_pages(output_folder, book_region):
     # whole run, so if the window is resized (or drops out of fullscreen) midway,
     # every following crop would silently cut the wrong part of the page.
     expected_size = None
+    # Uncropped grab behind the most recent grab_page() result - kept so that the
+    # end-of-book decision can be saved as uncropped evidence (see below).
+    last_shot = None
 
     def grab_page():
-        nonlocal expected_size
+        nonlocal expected_size, last_shot
         shot = grab_kindle_screenshot()
         if shot is None:
             return None
+        last_shot = shot
         if expected_size is None:
             expected_size = shot.size
             if book_region[2] > shot.size[0] or book_region[3] > shot.size[1]:
@@ -743,6 +838,7 @@ def capture_pages(output_folder, book_region):
         _save_page(output_folder, page_num, current)
         page_num += 1
         last_saved = current
+        last_saved_full = last_shot
 
         while True:
             check_stop_and_exit()
@@ -752,22 +848,34 @@ def capture_pages(output_folder, book_region):
             if new_page is None:
                 # No advance: might be end of book, or the reader lost keyboard
                 # focus (e.g. foreground was stolen). Re-activate and re-focus the
-                # reader with a click, wait for the click's chrome to fade again,
-                # then give it one more chance before concluding "end".
+                # reader with a click, wait until the screen is still again (the
+                # click's chrome done), then give it one more chance before
+                # concluding "end".
                 print("[INFO] Keine Aenderung - pruefe Buchende / Fokus...")
                 find_and_activate_kindle()
                 _click_reader_margin()
                 park_mouse_center()
-                wait_until_screen_stable(max_wait=6)
+                wait_until_still("nach Fokus-Klick")
                 press_next_page()
                 new_page = wait_for_new_page(last_saved)
                 if new_page is None:
+                    # Evidence for the end-of-book decision, both UNCROPPED: the
+                    # last saved page and what the window shows now. The decision
+                    # compares CROPPED images only, so content outside the crop is
+                    # invisible to it - these files show whether that happened.
+                    last_saved_full.save(Path.cwd() / "_debug_letzte_seite_voll.png")
+                    final = grab_kindle_screenshot()
+                    if final is not None:
+                        final.save(Path.cwd() / "_debug_buchende_voll.png")
+                    print("[INFO] Beweisbilder gespeichert: _debug_letzte_seite_voll.png, "
+                          "_debug_buchende_voll.png")
                     print("[OK] Buchende erreicht.")
                     break
 
             _save_page(output_folder, page_num, new_page)
             page_num += 1
             last_saved = new_page
+            last_saved_full = last_shot
 
     except KeyboardInterrupt:
         print("\n[INFO] Erfassung vom Benutzer gestoppt.")

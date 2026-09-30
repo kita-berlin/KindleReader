@@ -26,6 +26,7 @@
     <Compile Include="create_pdf.py" />
     <Compile Include="build_exe.py" />
     <Compile Include="create_markdown.py" />
+    <Compile Include="kindle_book_title.py" />
   </ItemGroup>
   <ItemGroup>
     <Content Include=".gitignore" />

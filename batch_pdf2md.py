@@ -59,7 +59,8 @@ import numpy as np
 from PIL import Image
 
 try:
-    import fitz  # PyMuPDF
+    # NOT 'import fitz': PyMuPDF 1.28.2 prints a deprecation warning for it on STDOUT.
+    import pymupdf
 except ImportError:
     print("[FEHLER] PyMuPDF nicht installiert! pip install PyMuPDF")
     sys.exit(1)
@@ -154,7 +155,7 @@ def _page_lines(page):
 
 def _render_page(page, dpi):
     zoom = dpi / 72.0
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
     return Image.open(io.BytesIO(pix.tobytes("png")))
 
 
@@ -169,7 +170,7 @@ def _raster_image_coverage(page):
     covered = 0.0
     try:
         for info in page.get_image_info():
-            covered += abs(fitz.Rect(info["bbox"]) & page.rect)
+            covered += abs(pymupdf.Rect(info["bbox"]) & page.rect)
     except Exception:
         return 0.0
     return min(1.0, covered / page_area)
@@ -397,7 +398,7 @@ def main():
                 print(f"{prefix} COPY  {rel}  (Duplikat von {seen[digest].relative_to(root)})", flush=True)
                 continue
 
-            doc = fitz.open(pdf)
+            doc = pymupdf.open(pdf)
             try:
                 kind = classify_book(doc)
                 print(f"{prefix} {kind}  {rel}  ({doc.page_count} Seiten)", flush=True)

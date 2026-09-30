@@ -31,7 +31,7 @@ Usage:
 Requirements:
 - Windows 10/11 with OCR language pack
 - PIL/Pillow, numpy, winsdk
-- PyMuPDF (fitz) for PDF input
+- PyMuPDF (pymupdf) for PDF input
 
 Author: Claude
 """
@@ -50,7 +50,10 @@ import numpy as np
 
 # PyMuPDF for PDF page extraction
 try:
-    import fitz  # PyMuPDF
+    # NOT 'import fitz': PyMuPDF 1.28.2 prints a deprecation warning for it on
+    # STDOUT, which corrupted the JSON of every --ocr-one subprocess (measured
+    # 29.09.2026: all pages 'OCR nach 4 Versuchen fehlgeschlagen', 0 words).
+    import pymupdf
     PYMUPDF_AVAILABLE = True
 except ImportError:
     PYMUPDF_AVAILABLE = False
@@ -210,10 +213,10 @@ def extract_pdf_pages(pdf_path, temp_dir, dpi=PDF_DPI):
         print("[FEHLER] PyMuPDF nicht installiert! pip install PyMuPDF")
         return []
 
-    doc = fitz.open(str(pdf_path))
+    doc = pymupdf.open(str(pdf_path))
     files = []
     zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
+    matrix = pymupdf.Matrix(zoom, zoom)
 
     print(f"[INFO] Extrahiere {len(doc)} Seiten aus PDF (DPI={dpi})...")
 

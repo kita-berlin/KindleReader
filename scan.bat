@@ -4,36 +4,52 @@ REM Copyright (c) 2025 Quantrosoft
 REM See LICENSE file for full license text.
 REM
 REM Kindle Book Capture, PDF Creation & Markdown for AI
-REM Usage: Run from the book folder (e.g., "Order Flow & Volume Profile")
-REM Skips steps if output already exists
+REM Usage: scan.bat [book folder]
+REM   No argument (e.g. double-click): the title of the book currently open in Kindle
+REM   is read from Kindle's own log (kindle_book_title.py) and the book folder
+REM   KINDLE_ROOT\<title> is created if missing.
+REM   With argument: that existing book folder is used (e.g. to redo PDF/markdown).
+REM Output (pages\, PDF, markdown\) always lands in the book folder, no matter from
+REM which directory scan.bat is started. Skips steps if output already exists.
 
 REM Get the directory where this batch file is located
 set "BOOKREADER=%~dp0"
 
-REM --- Zielordner (Buch-Ordner) bestimmen ---
-REM Erstes Argument = Buch-Ordner. Ohne Argument (z.B. Doppelklick) kommt ein
-REM Ordner-Auswahl-Dialog. So landet die Ausgabe (pages\, PDF, markdown\) IMMER im
-REM gewaehlten Buch-Ordner - egal aus welchem Verzeichnis scan.bat gestartet wird.
-if "%~1"=="" goto PICK_TARGET
-cd /d "%~1"
-if errorlevel 1 ( echo [FEHLER] Ordner nicht gefunden: %~1 & pause & exit /b 1 )
-goto TARGET_OK
-:PICK_TARGET
-echo [INFO] Kein Buch-Ordner uebergeben - bitte im Dialog waehlen...
-set "TARGET="
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -STA -Command "$f=(New-Object -ComObject Shell.Application).BrowseForFolder(0,'Buch-Ordner waehlen (hier entstehen pages, PDF, markdown)',0,'D:\GoogleDrive\eBooks\Trading\_Kindle'); if($f){$f.Self.Path}"`) do set "TARGET=%%I"
-if not defined TARGET ( echo [ABBRUCH] Kein Buch-Ordner gewaehlt. & pause & exit /b 1 )
-cd /d "%TARGET%"
-if errorlevel 1 ( echo [FEHLER] Ordner ungueltig: %TARGET% & pause & exit /b 1 )
-:TARGET_OK
-echo [INFO] Buch-Ordner (Ausgabe): %CD%
-echo.
+REM Root under which the book folder is created when no argument is given
+set "KINDLE_ROOT=D:\GoogleDriveData\ShareFile\eBooks\Trading\_Kindle"
 
-REM --- Python im PATH sicherstellen ---
+REM --- Make sure Python is on PATH (before the book-folder step, which runs Python) ---
 set "PYTHON_HOME=%LOCALAPPDATA%\Programs\Python\Python313"
 if exist "%PYTHON_HOME%\python.exe" (
     set "PATH=%PYTHON_HOME%;%PYTHON_HOME%\Scripts;%PATH%"
 )
+
+REM --- Book folder (output) ---
+REM Every path/name echoed below is QUOTED. Kindle titles contain ( ) and & (e.g.
+REM "... (Wiley Trading)"); unquoted inside a ( ... ) block the ')' ends the block.
+REM Measured 29.09.2026: folder "X (Wiley Trading)" -> '".pdf" kann syntaktisch an
+REM dieser Stelle nicht verarbeitet werden.', exit 255; "X Wiley Trading" -> ran through.
+if "%~1"=="" goto AUTO_TARGET
+cd /d "%~1"
+if errorlevel 1 ( echo [FEHLER] Ordner nicht gefunden: "%~1" & pause & exit /b 1 )
+goto TARGET_OK
+:AUTO_TARGET
+echo [INFO] Kein Buch-Ordner uebergeben - lese Titel des offenen Buchs aus dem Kindle-Log...
+REM kindle_book_title.py prints the folder path as UTF-8 on stdout, and for /f decodes
+REM it with the console code page. Measured 29.09.2026 in a real console: under the
+REM default code page 850 a path with an umlaut came back broken ('cd' failed), under
+REM 65001 it was intact. So switch to 65001 for the capture only, then restore.
+for /f "tokens=2 delims=:." %%C in ('chcp') do set "OLDCP=%%C"
+chcp 65001 >nul
+set "TARGET="
+for /f "usebackq delims=" %%I in (`python "%BOOKREADER%kindle_book_title.py" "%KINDLE_ROOT%"`) do set "TARGET=%%I"
+chcp %OLDCP% >nul
+if not defined TARGET ( echo [FEHLER] Kein Buch-Ordner - siehe Fehlermeldung oben. & pause & exit /b 1 )
+cd /d "%TARGET%"
+if errorlevel 1 ( echo [FEHLER] Ordner ungueltig: "%TARGET%" & pause & exit /b 1 )
+:TARGET_OK
+echo [INFO] Buch-Ordner (Ausgabe): "%CD%"
+echo.
 
 REM --- SCHRITT 0: ABHAENGIGKEITEN ---
 echo [INFO] Pruefe Python-Abhaengigkeiten...
@@ -62,8 +78,8 @@ if exist "markdown\%BOOKNAME%.md" set HAS_MD=1
 if %HAS_PAGES%==1 if %HAS_PDF%==1 if %HAS_MD%==1 (
     echo [INFO] Alles vorhanden - nichts zu tun.
     echo   Pages: pages\
-    echo   PDF:   %BOOKNAME%.pdf
-    echo   MD:    markdown\%BOOKNAME%.md
+    echo   PDF:   "%BOOKNAME%.pdf"
+    echo   MD:    "markdown\%BOOKNAME%.md"
     pause
     exit /b 0
 )
